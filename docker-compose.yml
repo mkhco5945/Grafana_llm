@@ -54,6 +54,34 @@ services:
       retries: 20
     restart: unless-stopped
 
+  mcp-grafana:
+    image: grafana/mcp-grafana:1.6.0
+    depends_on:
+      grafana:
+        condition: service_healthy
+    command:
+      - --transport
+      - streamable-http
+      - --address
+      - 0.0.0.0:8000
+      - --endpoint-path
+      - /mcp
+      - --allowed-hosts
+      - localhost:8000,127.0.0.1:8000,localhost:8002,127.0.0.1:8002
+      - --disable-assistant
+    environment:
+      GRAFANA_URL: http://grafana:3000
+      GRAFANA_SERVICE_ACCOUNT_TOKEN: ${GRAFANA_MCP_SERVICE_ACCOUNT_TOKEN:?Set GRAFANA_MCP_SERVICE_ACCOUNT_TOKEN in .env}
+      MCP_GRAFANA_SERVER_TOKEN: ${MCP_GRAFANA_SERVER_TOKEN:?Set MCP_GRAFANA_SERVER_TOKEN in .env}
+    ports:
+      - "127.0.0.1:8002:8000"
+    healthcheck:
+      test: ["CMD", "/usr/bin/bash", "-c", "exec 3<>/dev/tcp/127.0.0.1/8000; printf 'GET /healthz HTTP/1.1\\r\\nHost: localhost:8000\\r\\nConnection: close\\r\\n\\r\\n' >&3; grep -q '200 OK' <&3"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    restart: unless-stopped
+
 volumes:
   grafana-data:
   prometheus-data:
