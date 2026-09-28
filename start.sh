@@ -47,7 +47,11 @@ echo "[start] Building Grafana AI app plugin locally with Node $(node --version)
 pushd grafana-ai-plugin >/dev/null
 if [[ ! -x node_modules/.bin/webpack || ! -x node_modules/.bin/tsc ]]; then
   echo "[start] Installing Grafana plugin npm dependencies using the host network/proxy settings..."
-  npm install --no-audit --no-fund || die "npm install for grafana-ai-plugin failed. Your shell HTTP(S)_PROXY settings are used automatically by npm."
+  if [[ -f package-lock.json ]]; then
+    npm ci --no-audit --no-fund || die "npm ci for grafana-ai-plugin failed. Your shell HTTP(S)_PROXY settings are used automatically by npm."
+  else
+    npm install --no-audit --no-fund || die "npm install for grafana-ai-plugin failed. Your shell HTTP(S)_PROXY settings are used automatically by npm."
+  fi
 fi
 npm run typecheck || die "Grafana AI plugin typecheck failed."
 npm run build || die "Grafana AI plugin build failed."
@@ -79,6 +83,21 @@ until container_health grafana && container_health prometheus && container_healt
   }
   sleep 2
 done
+
+# Plugin proxy routes require an org-scoped plugin settings row. autoEnabled makes
+# the app visible, but does not guarantee that row exists on an already-running
+# Grafana data volume. Upsert it explicitly so repeated local runs are reliable.
+echo "[start] Ensuring the AI app is enabled for Grafana org 1..."
+if ! curl -fsS --max-time 10 -u admin:admin \
+  -H 'Content-Type: application/json' \
+  -X POST http://127.0.0.1:3000/api/plugins/mkhco-ai-dashboard-app/settings \
+  -d '{"enabled":true,"pinned":false,"jsonData":{}}' >/dev/null; then
+  echo "[start] Failed to create/update Grafana app settings. Current plugin settings response:" >&2
+  curl -sS --max-time 10 -u admin:admin \
+    http://127.0.0.1:3000/api/plugins/mkhco-ai-dashboard-app/settings >&2 || true
+  printf '\n' >&2
+  die "Could not enable AI Dashboard Builder app."
+fi
 
 if [[ ! -x .venv/bin/python ]]; then
   echo "[start] Creating the uv environment..."
