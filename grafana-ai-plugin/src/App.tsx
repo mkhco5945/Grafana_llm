@@ -6,6 +6,25 @@ import { ChatHistoryItem, health, startChat, waitForJob } from './api';
 
 type UiMessage = ChatHistoryItem & { id: string };
 
+type PersistedChatState = {
+  messages: UiMessage[];
+  input: string;
+  model: string;
+  progress: string[];
+  error: string;
+  dashboardUrl: string;
+  activeJobId: string;
+};
+
+const STORAGE_KEY = 'mkhco-ai-dashboard-app.chat.v1';
+
+const welcomeMessage: UiMessage = {
+  id: 'welcome',
+  role: 'assistant',
+  content:
+    'Tell me what you want to learn from the live data or what dashboard you want created. Read-only questions use the fast local model; dashboard writes use the stronger local model.',
+};
+
 const starterPrompts = [
   'Inspect the live demo data and tell me what looks abnormal right now.',
   'Create a new Grafana dashboard called AI Demo Service Health using the live demo Prometheus metrics. Use useful modern panels, validate every PromQL query, create it through Grafana MCP, then verify it and give me the URL.',
@@ -58,6 +77,53 @@ const inputStyle: CSSProperties = {
   font: 'inherit',
 };
 
+function emptyPersistedState(): PersistedChatState {
+  return {
+    messages: [welcomeMessage],
+    input: '',
+    model: '',
+    progress: [],
+    error: '',
+    dashboardUrl: '',
+    activeJobId: '',
+  };
+}
+
+function loadPersistedState(): PersistedChatState {
+  const fallback = emptyPersistedState();
+  try {
+    const raw = window.localStorage.getItem(STORAGE_KEY);
+    if (!raw) {
+      return fallback;
+    }
+    const parsed = JSON.parse(raw) as Partial<PersistedChatState>;
+    const messages = Array.isArray(parsed.messages)
+      ? parsed.messages
+          .filter(
+            (item): item is UiMessage =>
+              Boolean(item) &&
+              typeof item.id === 'string' &&
+              (item.role === 'user' || item.role === 'assistant') &&
+              typeof item.content === 'string'
+          )
+          .slice(-100)
+      : [];
+    return {
+      messages: messages.length ? messages : fallback.messages,
+      input: typeof parsed.input === 'string' ? parsed.input : '',
+      model: typeof parsed.model === 'string' ? parsed.model : '',
+      progress: Array.isArray(parsed.progress)
+        ? parsed.progress.filter((item): item is string => typeof item === 'string').slice(-80)
+        : [],
+      error: typeof parsed.error === 'string' ? parsed.error : '',
+      dashboardUrl: typeof parsed.dashboardUrl === 'string' ? parsed.dashboardUrl : '',
+      activeJobId: typeof parsed.activeJobId === 'string' ? parsed.activeJobId : '',
+    };
+  } catch {
+    return fallback;
+  }
+}
+
 function MessageBubble({ message }: { message: UiMessage }) {
   const isUser = message.role === 'user';
   return (
@@ -78,22 +144,18 @@ function MessageBubble({ message }: { message: UiMessage }) {
 }
 
 export default function App() {
+  const [restored] = useState<PersistedChatState>(() => loadPersistedState());
   const [connected, setConnected] = useState<boolean | null>(null);
-  const [messages, setMessages] = useState<UiMessage[]>([
-    {
-      id: 'welcome',
-      role: 'assistant',
-      content:
-        'Tell me what you want to learn from the live data or what dashboard you want created. Read-only questions use the fast local model; dashboard writes use the stronger local model.',
-    },
-  ]);
-  const [input, setInput] = useState('');
-  const [working, setWorking] = useState(false);
-  const [model, setModel] = useState('');
-  const [progress, setProgress] = useState<string[]>([]);
-  const [error, setError] = useState('');
-  const [dashboardUrl, setDashboardUrl] = useState('');
+  const [messages, setMessages] = useState<UiMessage[]>(restored.messages);
+  const [input, setInput] = useState(restored.input);
+  const [submitting, setSubmitting] = useState(false);
+  const [activeJobId, setActiveJobId] = useState(restored.activeJobId);
+  const [model, setModel] = useState(restored.model);
+  const [progress, setProgress] = useState<string[]>(restored.progress);
+  const [error, setError] = useState(restored.error);
+  const [dashboardUrl, setDashboardUrl] = useState(restored.dashboardUrl);
   const messageEndRef = useRef<HTMLDivElement | null>(null);
+  const working = submitting || Boolean(activeJobId);
 
   useEffect(() => {
     health()
@@ -102,8 +164,78 @@ export default function App() {
   }, []);
 
   useEffect(() => {
+    const state: PersistedChatState = {
+      messages: messages.slice(-100),
+      input,
+      model,
+      progress: progress.slice(-80),
+      error,
+      dashboardUrl,
+      activeJobId,
+    };
+    try {
+      window.localStorage.setItem(STORAGE_KEY, JSON.stringify(state));
+    } catch {
+      // Chat persistence is best-effort. The app remains usable if browser storage is unavailable.
+    }
+  }, [messages, input, model, progress, error, dashboardUrl, activeJobId]);
+
+  useEffect(() => {
     messageEndRef.current?.scrollIntoView({ behavior: 'smooth' });
   }, [messages, progress]);
+
+  useEffect(() => {
+    if (!activeJobId) {
+      return;
+    }
+
+    let cancelled = false;
+    const resume = async () => {
+      try {
+        const result = await waitForJob(activeJobId, (job) => {
+          if (cancelled) {
+            return;
+          }
+          setModel(job.model);
+          setProgress(job.progress ?? []);
+        });
+        if (cancelled) {
+          return;
+        }
+        if (result.status === 'failed') {
+          throw new Error(result.error || 'AI job failed');
+        }
+        const assistantId = `job-${result.id}`;
+        setMessages((items) => {
+          if (items.some((item) => item.id === assistantId)) {
+            return items;
+          }
+          return [
+            ...items,
+            {
+              id: assistantId,
+              role: 'assistant',
+              content: result.answer || 'The agent completed without a text answer.',
+            },
+          ];
+        });
+        setDashboardUrl(result.dashboard_url || '');
+        setError('');
+        setActiveJobId('');
+      } catch (cause) {
+        if (cancelled) {
+          return;
+        }
+        setError(cause instanceof Error ? cause.message : String(cause));
+        setActiveJobId('');
+      }
+    };
+
+    void resume();
+    return () => {
+      cancelled = true;
+    };
+  }, [activeJobId]);
 
   const history = useMemo<ChatHistoryItem[]>(
     () =>
@@ -124,33 +256,37 @@ export default function App() {
     setDashboardUrl('');
     setProgress([]);
     setInput('');
-    setWorking(true);
+    setSubmitting(true);
     const userMessage: UiMessage = { id: `u-${Date.now()}`, role: 'user', content: message };
     setMessages((items) => [...items, userMessage]);
 
     try {
       const started = await startChat(message, history);
       setModel(started.model);
-      const result = await waitForJob(started.job_id, (job) => {
-        setModel(job.model);
-        setProgress(job.progress ?? []);
-      });
-      if (result.status === 'failed') {
-        throw new Error(result.error || 'AI job failed');
-      }
-      setMessages((items) => [
-        ...items,
-        {
-          id: `a-${Date.now()}`,
-          role: 'assistant',
-          content: result.answer || 'The agent completed without a text answer.',
-        },
-      ]);
-      setDashboardUrl(result.dashboard_url || '');
+      setActiveJobId(started.job_id);
     } catch (cause) {
       setError(cause instanceof Error ? cause.message : String(cause));
     } finally {
-      setWorking(false);
+      setSubmitting(false);
+    }
+  };
+
+  const clearChat = () => {
+    if (working) {
+      return;
+    }
+    const fresh = emptyPersistedState();
+    setMessages(fresh.messages);
+    setInput('');
+    setModel('');
+    setProgress([]);
+    setError('');
+    setDashboardUrl('');
+    setActiveJobId('');
+    try {
+      window.localStorage.removeItem(STORAGE_KEY);
+    } catch {
+      // Ignore unavailable browser storage.
     }
   };
 
@@ -215,6 +351,10 @@ export default function App() {
             is available from this app page and Grafana’s command palette. The right-hand chat is the first-party builder workspace without
             maintaining a fork of Grafana.
           </p>
+          <p style={{ opacity: 0.8 }}>
+            Chat history and the current AI job are saved in this browser. You can navigate to another Grafana page or switch tabs and come
+            back; an in-progress job will keep running on the local AI bridge and this page will reconnect to it automatically.
+          </p>
         </div>
 
         {dashboardUrl && (
@@ -225,11 +365,42 @@ export default function App() {
       </main>
 
       <aside style={sidebarStyle}>
-        <div style={{ padding: '14px 16px', borderBottom: '1px solid rgba(128,128,128,0.25)' }}>
-          <strong>Local Grafana AI</strong>
-          <div style={{ fontSize: 12, opacity: 0.7, marginTop: 4 }}>
-            {working ? `Working with ${model || 'local model'}…` : model ? `Last model: ${model}` : 'Ready'}
+        <div
+          style={{
+            padding: '14px 16px',
+            borderBottom: '1px solid rgba(128,128,128,0.25)',
+            display: 'flex',
+            alignItems: 'center',
+            justifyContent: 'space-between',
+            gap: 12,
+          }}
+        >
+          <div>
+            <strong>Local Grafana AI</strong>
+            <div style={{ fontSize: 12, opacity: 0.7, marginTop: 4 }}>
+              {working
+                ? `Working with ${model || 'local model'}… safe to leave this page`
+                : model
+                  ? `Last model: ${model}`
+                  : 'Ready'}
+            </div>
           </div>
+          <button
+            type="button"
+            onClick={clearChat}
+            disabled={working}
+            style={{
+              border: '1px solid rgba(128,128,128,0.35)',
+              borderRadius: 6,
+              background: 'transparent',
+              color: 'inherit',
+              padding: '6px 9px',
+              cursor: working ? 'default' : 'pointer',
+              opacity: working ? 0.5 : 0.8,
+            }}
+          >
+            New chat
+          </button>
         </div>
 
         <div style={messagesStyle}>
@@ -277,7 +448,10 @@ export default function App() {
               }
             }}
           />
-          <div style={{ display: 'flex', justifyContent: 'flex-end', marginTop: 10 }}>
+          <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', gap: 12, marginTop: 10 }}>
+            <span style={{ fontSize: 11, opacity: 0.65 }}>
+              {working ? 'This job will keep running if you navigate away.' : 'Chat is saved in this browser.'}
+            </span>
             <Button type="submit" disabled={working || !input.trim() || connected === false}>
               {working ? 'Working…' : 'Send'}
             </Button>
