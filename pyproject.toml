@@ -1,0 +1,13 @@
+[project]
+name = "grafana-local-agent"
+version = "0.1.0"
+description = "Small local Ollama agent for authenticated Grafana MCP"
+requires-python = ">=3.10"
+dependencies = [
+  "httpx2>=2.5.0,<3",
+  "mcp==2.2.0",
+  "python-dotenv>=1.0.1,<2",
+]
+
+[dependency-groups]
+dev = []
