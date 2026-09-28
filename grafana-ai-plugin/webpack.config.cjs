@@ -15,7 +15,6 @@ module.exports = {
   externals: [
     'react',
     'react-dom',
-    'react/jsx-runtime',
     'rxjs',
     /^@grafana\/data/i,
     /^@grafana\/runtime/i,
@@ -32,7 +31,10 @@ module.exports = {
             jsc: {
               target: 'es2020',
               parser: { syntax: 'typescript', tsx: true },
-              transform: { react: { runtime: 'automatic' } },
+              // Grafana 12 exposes React itself to AMD plugins, but the hand-written
+              // bundle does not get create-plugin's react/jsx-runtime mapping. Use
+              // the classic transform so the browser never requests /react/jsx-runtime.
+              transform: { react: { runtime: 'classic' } },
             },
           },
         },
