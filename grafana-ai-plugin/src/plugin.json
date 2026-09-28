@@ -1,0 +1,57 @@
+{
+  "$schema": "https://raw.githubusercontent.com/grafana/grafana/main/docs/sources/developers/plugins/plugin.schema.json",
+  "type": "app",
+  "name": "AI Dashboard Builder",
+  "id": "mkhco-ai-dashboard-app",
+  "autoEnabled": true,
+  "preload": true,
+  "info": {
+    "keywords": ["ai", "dashboard", "ollama", "prometheus", "mcp"],
+    "description": "Local AI assistant for exploring Grafana data and creating dashboards with Ollama and Grafana MCP.",
+    "author": {
+      "name": "mkhco"
+    },
+    "logos": {
+      "small": "img/logo.svg",
+      "large": "img/logo.svg"
+    },
+    "screenshots": [],
+    "version": "0.1.0",
+    "updated": "2026-09-28"
+  },
+  "includes": [
+    {
+      "type": "page",
+      "name": "Create dashboard with AI",
+      "path": "/a/mkhco-ai-dashboard-app",
+      "addToNav": true,
+      "defaultNav": true
+    }
+  ],
+  "routes": [
+    {
+      "path": "ai",
+      "url": "http://host.docker.internal:8010",
+      "reqSignedIn": true,
+      "reqRole": "Editor"
+    }
+  ],
+  "extensions": {
+    "addedLinks": [
+      {
+        "title": "Create dashboard with AI",
+        "description": "Open the local AI dashboard builder",
+        "targets": ["grafana/commandpalette/action"]
+      },
+      {
+        "title": "Open AI dashboard builder",
+        "description": "Ask the local AI to inspect or modify Grafana dashboards",
+        "targets": ["grafana/dashboard/panel/menu"]
+      }
+    ]
+  },
+  "dependencies": {
+    "grafanaDependency": ">=12.1.0",
+    "plugins": []
+  }
+}
