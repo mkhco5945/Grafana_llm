@@ -1,29 +1,24 @@
-import React, { CSSProperties, FormEvent, useEffect, useMemo, useRef, useState } from 'react';
+import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import type { CSSProperties, FormEvent } from 'react';
 
 import { Alert, Button, Spinner } from '@grafana/ui';
 
-import { ChatHistoryItem, health, startChat, waitForJob } from './api';
+import {
+  createSession,
+  getJob,
+  getSession,
+  health,
+  importLegacyChat,
+  listSessions,
+  retryJob,
+  startChat,
+} from './api';
+import type { ChatMessage, JobResponse, LegacyChatState, SessionDetail, SessionSummary } from './api';
 
-type UiMessage = ChatHistoryItem & { id: string };
-
-type PersistedChatState = {
-  messages: UiMessage[];
-  input: string;
-  model: string;
-  progress: string[];
-  error: string;
-  dashboardUrl: string;
-  activeJobId: string;
-};
-
-const STORAGE_KEY = 'mkhco-ai-dashboard-app.chat.v1';
-
-const welcomeMessage: UiMessage = {
-  id: 'welcome',
-  role: 'assistant',
-  content:
-    'Tell me what you want to learn from the live data or what dashboard you want created. Read-only questions use the fast local model; dashboard writes use the stronger local model.',
-};
+const LEGACY_STORAGE_KEY = 'mkhco-ai-dashboard-app.chat.v1';
+const MIGRATION_MARKER_KEY = 'mkhco-ai-dashboard-app.chat.v1.server-migrated';
+const ACTIVE_SESSION_KEY = 'mkhco-ai-dashboard-app.active-session.v2';
+const DRAFTS_KEY = 'mkhco-ai-dashboard-app.drafts.v2';
 
 const starterPrompts = [
   'Inspect the live demo data and tell me what looks abnormal right now.',
@@ -34,26 +29,14 @@ const starterPrompts = [
 const pageStyle: CSSProperties = {
   minHeight: 'calc(100vh - 80px)',
   display: 'grid',
-  gridTemplateColumns: 'minmax(0, 1fr) minmax(380px, 520px)',
+  gridTemplateColumns: 'minmax(0, 1fr) minmax(420px, 560px)',
   gap: 20,
   padding: 20,
 };
 
-const workspaceStyle: CSSProperties = {
+const panelStyle: CSSProperties = {
   border: '1px solid rgba(128,128,128,0.25)',
   borderRadius: 8,
-  padding: 24,
-  minHeight: 620,
-};
-
-const sidebarStyle: CSSProperties = {
-  border: '1px solid rgba(128,128,128,0.25)',
-  borderRadius: 8,
-  minHeight: 620,
-  maxHeight: 'calc(100vh - 110px)',
-  display: 'flex',
-  flexDirection: 'column',
-  overflow: 'hidden',
 };
 
 const messagesStyle: CSSProperties = {
@@ -77,57 +60,40 @@ const inputStyle: CSSProperties = {
   font: 'inherit',
 };
 
-function emptyPersistedState(): PersistedChatState {
-  return {
-    messages: [welcomeMessage],
-    input: '',
-    model: '',
-    progress: [],
-    error: '',
-    dashboardUrl: '',
-    activeJobId: '',
-  };
-}
-
-function loadPersistedState(): PersistedChatState {
-  const fallback = emptyPersistedState();
+function readDrafts(): Record<string, string> {
   try {
-    const raw = window.localStorage.getItem(STORAGE_KEY);
-    if (!raw) {
-      return fallback;
-    }
-    const parsed = JSON.parse(raw) as Partial<PersistedChatState>;
-    const messages = Array.isArray(parsed.messages)
-      ? parsed.messages
-          .filter(
-            (item): item is UiMessage =>
-              Boolean(item) &&
-              typeof item.id === 'string' &&
-              (item.role === 'user' || item.role === 'assistant') &&
-              typeof item.content === 'string'
-          )
-          .slice(-100)
-      : [];
-    return {
-      messages: messages.length ? messages : fallback.messages,
-      input: typeof parsed.input === 'string' ? parsed.input : '',
-      model: typeof parsed.model === 'string' ? parsed.model : '',
-      progress: Array.isArray(parsed.progress)
-        ? parsed.progress.filter((item): item is string => typeof item === 'string').slice(-80)
-        : [],
-      error: typeof parsed.error === 'string' ? parsed.error : '',
-      dashboardUrl: typeof parsed.dashboardUrl === 'string' ? parsed.dashboardUrl : '',
-      activeJobId: typeof parsed.activeJobId === 'string' ? parsed.activeJobId : '',
-    };
+    const parsed = JSON.parse(window.localStorage.getItem(DRAFTS_KEY) || '{}');
+    return parsed && typeof parsed === 'object' ? parsed : {};
   } catch {
-    return fallback;
+    return {};
   }
 }
 
-function MessageBubble({ message }: { message: UiMessage }) {
+function readLegacyState(): LegacyChatState | null {
+  try {
+    const parsed = JSON.parse(window.localStorage.getItem(LEGACY_STORAGE_KEY) || 'null') as LegacyChatState | null;
+    if (!parsed || !Array.isArray(parsed.messages)) {
+      return null;
+    }
+    const usefulMessages = parsed.messages.filter(
+      (item) =>
+        item &&
+        item.id !== 'welcome' &&
+        (item.role === 'user' || item.role === 'assistant') &&
+        typeof item.content === 'string' &&
+        item.content.trim()
+    );
+    return usefulMessages.length ? { ...parsed, messages: usefulMessages } : null;
+  } catch {
+    return null;
+  }
+}
+
+function MessageBubble({ message }: { message: ChatMessage }) {
   const isUser = message.role === 'user';
   return (
     <div
+      data-testid={`chat-message-${message.role}`}
       style={{
         alignSelf: isUser ? 'flex-end' : 'stretch',
         maxWidth: isUser ? '88%' : '100%',
@@ -143,150 +109,220 @@ function MessageBubble({ message }: { message: UiMessage }) {
   );
 }
 
-export default function App() {
-  const [restored] = useState<PersistedChatState>(() => loadPersistedState());
-  const [connected, setConnected] = useState<boolean | null>(null);
-  const [messages, setMessages] = useState<UiMessage[]>(restored.messages);
-  const [input, setInput] = useState(restored.input);
-  const [submitting, setSubmitting] = useState(false);
-  const [activeJobId, setActiveJobId] = useState(restored.activeJobId);
-  const [model, setModel] = useState(restored.model);
-  const [progress, setProgress] = useState<string[]>(restored.progress);
-  const [error, setError] = useState(restored.error);
-  const [dashboardUrl, setDashboardUrl] = useState(restored.dashboardUrl);
-  const messageEndRef = useRef<HTMLDivElement | null>(null);
-  const working = submitting || Boolean(activeJobId);
+function statusColor(status: string) {
+  if (status === 'completed') return '#56a64b';
+  if (status === 'running' || status === 'queued') return '#5794f2';
+  if (status === 'failed' || status === 'interrupted') return '#e02f44';
+  return 'rgba(128,128,128,0.8)';
+}
 
-  useEffect(() => {
-    health()
-      .then(() => setConnected(true))
-      .catch(() => setConnected(false));
+export default function App() {
+  const [connected, setConnected] = useState<boolean | null>(null);
+  const [sessions, setSessions] = useState<SessionSummary[]>([]);
+  const [selectedSessionId, setSelectedSessionId] = useState('');
+  const [session, setSession] = useState<SessionDetail | null>(null);
+  const [input, setInput] = useState('');
+  const [submitting, setSubmitting] = useState(false);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState('');
+  const [migrationNotice, setMigrationNotice] = useState('');
+  const messageEndRef = useRef<HTMLDivElement | null>(null);
+
+  const refreshSessionList = useCallback(async () => {
+    const values = await listSessions();
+    setSessions(values);
+    return values;
   }, []);
 
-  useEffect(() => {
-    const state: PersistedChatState = {
-      messages: messages.slice(-100),
-      input,
-      model,
-      progress: progress.slice(-80),
-      error,
-      dashboardUrl,
-      activeJobId,
-    };
-    try {
-      window.localStorage.setItem(STORAGE_KEY, JSON.stringify(state));
-    } catch {
-      // Chat persistence is best-effort. The app remains usable if browser storage is unavailable.
-    }
-  }, [messages, input, model, progress, error, dashboardUrl, activeJobId]);
+  const reloadSelectedSession = useCallback(async () => {
+    if (!selectedSessionId) return null;
+    const value = await getSession(selectedSessionId);
+    setSession(value);
+    return value;
+  }, [selectedSessionId]);
 
   useEffect(() => {
-    messageEndRef.current?.scrollIntoView({ behavior: 'smooth' });
-  }, [messages, progress]);
-
-  useEffect(() => {
-    if (!activeJobId) {
-      return;
-    }
-
     let cancelled = false;
-    const resume = async () => {
+    const initialize = async () => {
       try {
-        const result = await waitForJob(activeJobId, (job) => {
-          if (cancelled) {
-            return;
+        await health();
+        if (cancelled) return;
+        setConnected(true);
+
+        let migratedSessionId = '';
+        let legacyDraft = '';
+        if (!window.localStorage.getItem(MIGRATION_MARKER_KEY)) {
+          const legacy = readLegacyState();
+          const rawLegacy = (() => {
+            try {
+              return JSON.parse(window.localStorage.getItem(LEGACY_STORAGE_KEY) || 'null') as { input?: unknown } | null;
+            } catch {
+              return null;
+            }
+          })();
+          legacyDraft = typeof rawLegacy?.input === 'string' ? rawLegacy.input : '';
+          if (legacy) {
+            const migrated = await importLegacyChat(legacy);
+            migratedSessionId = migrated.session.id;
+            setMigrationNotice(
+              migrated.already_imported ? 'Your browser chat was already imported.' : 'Your previous browser chat was imported to SQLite.'
+            );
           }
-          setModel(job.model);
-          setProgress(job.progress ?? []);
-        });
-        if (cancelled) {
-          return;
+          // Preserve the old key for manual recovery; this marker only prevents duplicate imports.
+          window.localStorage.setItem(MIGRATION_MARKER_KEY, 'done');
         }
-        if (result.status === 'failed') {
-          throw new Error(result.error || 'AI job failed');
+
+        let values = await refreshSessionList();
+        if (!values.length) {
+          const created = await createSession();
+          values = await refreshSessionList();
+          migratedSessionId = created.id;
         }
-        const assistantId = `job-${result.id}`;
-        setMessages((items) => {
-          if (items.some((item) => item.id === assistantId)) {
-            return items;
-          }
-          return [
-            ...items,
-            {
-              id: assistantId,
-              role: 'assistant',
-              content: result.answer || 'The agent completed without a text answer.',
-            },
-          ];
-        });
-        setDashboardUrl(result.dashboard_url || '');
-        setError('');
-        setActiveJobId('');
+        const remembered = window.localStorage.getItem(ACTIVE_SESSION_KEY) || '';
+        const preferred =
+          migratedSessionId || (values.some((item) => item.id === remembered) ? remembered : '') || values[0]?.id || '';
+        if (legacyDraft && preferred) {
+          const drafts = readDrafts();
+          drafts[preferred] = legacyDraft;
+          window.localStorage.setItem(DRAFTS_KEY, JSON.stringify(drafts));
+        }
+        if (!cancelled) setSelectedSessionId(preferred);
       } catch (cause) {
-        if (cancelled) {
-          return;
-        }
+        if (cancelled) return;
+        setConnected(false);
         setError(cause instanceof Error ? cause.message : String(cause));
-        setActiveJobId('');
+      } finally {
+        if (!cancelled) setLoading(false);
       }
     };
-
-    void resume();
+    void initialize();
     return () => {
       cancelled = true;
     };
-  }, [activeJobId]);
+  }, [refreshSessionList]);
 
-  const history = useMemo<ChatHistoryItem[]>(
-    () =>
-      messages
-        .filter((item) => item.id !== 'welcome')
-        .map(({ role, content }) => ({ role, content }))
-        .slice(-10),
-    [messages]
-  );
+  useEffect(() => {
+    if (!selectedSessionId) {
+      setSession(null);
+      return;
+    }
+    let cancelled = false;
+    setLoading(true);
+    window.localStorage.setItem(ACTIVE_SESSION_KEY, selectedSessionId);
+    setInput(readDrafts()[selectedSessionId] || '');
+    getSession(selectedSessionId)
+      .then((value) => {
+        if (!cancelled) {
+          setSession(value);
+          setError('');
+        }
+      })
+      .catch((cause) => {
+        if (!cancelled) setError(cause instanceof Error ? cause.message : String(cause));
+      })
+      .finally(() => {
+        if (!cancelled) setLoading(false);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [selectedSessionId]);
+
+  useEffect(() => {
+    if (!selectedSessionId) return;
+    const drafts = readDrafts();
+    if (input) drafts[selectedSessionId] = input;
+    else delete drafts[selectedSessionId];
+    try {
+      window.localStorage.setItem(DRAFTS_KEY, JSON.stringify(drafts));
+    } catch {
+      // Draft persistence is optional; server messages remain authoritative.
+    }
+  }, [input, selectedSessionId]);
+
+  const activeJobId = session?.active_job?.id || '';
+  useEffect(() => {
+    if (!activeJobId) return;
+    let cancelled = false;
+    let polling = false;
+    const poll = async () => {
+      if (polling || cancelled) return;
+      polling = true;
+      try {
+        const job = await getJob(activeJobId);
+        if (cancelled) return;
+        if (job.status === 'queued' || job.status === 'running') {
+          setSession((current) => (current ? { ...current, active_job: job } : current));
+        } else {
+          await reloadSelectedSession();
+          await refreshSessionList();
+        }
+      } catch (cause) {
+        if (!cancelled) setError(cause instanceof Error ? cause.message : String(cause));
+      } finally {
+        polling = false;
+      }
+    };
+    void poll();
+    const timer = window.setInterval(() => void poll(), 1000);
+    return () => {
+      cancelled = true;
+      window.clearInterval(timer);
+    };
+  }, [activeJobId, refreshSessionList, reloadSelectedSession]);
+
+  useEffect(() => {
+    messageEndRef.current?.scrollIntoView({ behavior: 'smooth' });
+  }, [session?.messages, session?.active_job?.progress]);
+
+  const latestJob = useMemo<JobResponse | null>(() => {
+    const jobs = session?.jobs || [];
+    return session?.active_job || jobs[jobs.length - 1] || null;
+  }, [session]);
+  const working = submitting || latestJob?.status === 'queued' || latestJob?.status === 'running';
+  const messages = session?.messages || [];
 
   const send = async (text?: string) => {
     const message = (text ?? input).trim();
-    if (!message || working) {
-      return;
-    }
-
-    setError('');
-    setDashboardUrl('');
-    setProgress([]);
-    setInput('');
+    if (!message || !selectedSessionId || working) return;
     setSubmitting(true);
-    const userMessage: UiMessage = { id: `u-${Date.now()}`, role: 'user', content: message };
-    setMessages((items) => [...items, userMessage]);
-
+    setError('');
+    setInput('');
     try {
-      const started = await startChat(message, history);
-      setModel(started.model);
-      setActiveJobId(started.job_id);
+      await startChat(selectedSessionId, message);
+      await reloadSelectedSession();
+      await refreshSessionList();
     } catch (cause) {
+      setInput(message);
       setError(cause instanceof Error ? cause.message : String(cause));
     } finally {
       setSubmitting(false);
     }
   };
 
-  const clearChat = () => {
-    if (working) {
-      return;
-    }
-    const fresh = emptyPersistedState();
-    setMessages(fresh.messages);
-    setInput('');
-    setModel('');
-    setProgress([]);
-    setError('');
-    setDashboardUrl('');
-    setActiveJobId('');
+  const newChat = async () => {
     try {
-      window.localStorage.removeItem(STORAGE_KEY);
-    } catch {
-      // Ignore unavailable browser storage.
+      const created = await createSession();
+      await refreshSessionList();
+      setSelectedSessionId(created.id);
+      setError('');
+    } catch (cause) {
+      setError(cause instanceof Error ? cause.message : String(cause));
+    }
+  };
+
+  const retry = async () => {
+    if (!latestJob || !['failed', 'interrupted'].includes(latestJob.status)) return;
+    setSubmitting(true);
+    setError('');
+    try {
+      await retryJob(latestJob.id);
+      await reloadSelectedSession();
+      await refreshSessionList();
+    } catch (cause) {
+      setError(cause instanceof Error ? cause.message : String(cause));
+    } finally {
+      setSubmitting(false);
     }
   };
 
@@ -296,14 +332,14 @@ export default function App() {
   };
 
   return (
-    <div style={pageStyle}>
-      <main style={workspaceStyle}>
+    <div data-testid="ai-dashboard-builder-root" style={pageStyle}>
+      <main style={{ ...panelStyle, padding: 24, minHeight: 620 }}>
         <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 12 }}>
           <div>
             <h1 style={{ marginTop: 0 }}>AI Dashboard Builder</h1>
             <p style={{ maxWidth: 760, opacity: 0.8 }}>
-              This app talks to the same local Ollama + Grafana MCP agent used by the CLI. The model must discover real metrics,
-              validate PromQL, write dashboards through MCP, and verify saved queries before claiming success.
+              This app talks to the same local Ollama + Grafana MCP agent used by the CLI. The model discovers real metrics,
+              validates PromQL, writes dashboards through MCP, and verifies saved queries before claiming success.
             </p>
           </div>
           <div style={{ fontSize: 13, opacity: 0.8 }}>
@@ -316,6 +352,7 @@ export default function App() {
             Run ./start.sh and check .run/ai-api.log.
           </Alert>
         )}
+        {migrationNotice && <Alert title="Chat migration complete" severity="success">{migrationNotice}</Alert>}
 
         <h3>Try it</h3>
         <div style={{ display: 'grid', gap: 10, maxWidth: 900 }}>
@@ -324,7 +361,7 @@ export default function App() {
               key={prompt}
               type="button"
               onClick={() => void send(prompt)}
-              disabled={working}
+              disabled={working || !selectedSessionId}
               style={{
                 textAlign: 'left',
                 border: '1px solid rgba(128,128,128,0.28)',
@@ -341,95 +378,107 @@ export default function App() {
         </div>
 
         <div style={{ marginTop: 28 }}>
-          <h3>How model routing works</h3>
+          <h3>Persistent conversations</h3>
           <p style={{ opacity: 0.8 }}>
-            Questions and data inspection use <code>qwen3:4b</code>. Creating or modifying a dashboard automatically uses{' '}
-            <code>qwen3:8b</code>. Both use the same host-side grounding and dashboard verification guards.
+            Messages, progress, model selection, results, and dashboard links are stored by the local AI bridge in SQLite. You can
+            navigate away, close the browser, or restart Grafana and reopen any chat from the history list.
           </p>
           <p style={{ opacity: 0.8 }}>
-            Grafana 12.1 does not expose a public extension point inside the native “New dashboard” chooser, so “Create dashboard with AI”
-            is available from this app page and Grafana’s command palette. The right-hand chat is the first-party builder workspace without
-            maintaining a fork of Grafana.
-          </p>
-          <p style={{ opacity: 0.8 }}>
-            Chat history and the current AI job are saved in this browser. You can navigate to another Grafana page or switch tabs and come
-            back; an in-progress job will keep running on the local AI bridge and this page will reconnect to it automatically.
+            A running Python worker continues when you leave this page. If the AI bridge itself restarts, its saved request becomes
+            interrupted and can be retried safely from this conversation.
           </p>
         </div>
 
-        {dashboardUrl && (
+        {latestJob?.dashboard_url && (
           <div style={{ marginTop: 24 }}>
-            <Button onClick={() => (window.location.href = dashboardUrl)}>Open created dashboard</Button>
+            <Button onClick={() => (window.location.href = latestJob.dashboard_url)}>Open created dashboard</Button>
           </div>
         )}
       </main>
 
-      <aside style={sidebarStyle}>
-        <div
-          style={{
-            padding: '14px 16px',
-            borderBottom: '1px solid rgba(128,128,128,0.25)',
-            display: 'flex',
-            alignItems: 'center',
-            justifyContent: 'space-between',
-            gap: 12,
-          }}
-        >
-          <div>
-            <strong>Local Grafana AI</strong>
-            <div style={{ fontSize: 12, opacity: 0.7, marginTop: 4 }}>
-              {working
-                ? `Working with ${model || 'local model'}… safe to leave this page`
-                : model
-                  ? `Last model: ${model}`
-                  : 'Ready'}
-            </div>
+      <aside style={{ ...panelStyle, minHeight: 620, maxHeight: 'calc(100vh - 110px)', display: 'flex', flexDirection: 'column', overflow: 'hidden' }}>
+        <div style={{ padding: 14, borderBottom: '1px solid rgba(128,128,128,0.25)' }}>
+          <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 12 }}>
+            <strong>Chats</strong>
+            <button
+              type="button"
+              data-testid="new-chat"
+              onClick={() => void newChat()}
+              style={{ border: '1px solid rgba(128,128,128,0.35)', borderRadius: 6, background: 'transparent', color: 'inherit', padding: '6px 9px', cursor: 'pointer' }}
+            >
+              + New chat
+            </button>
           </div>
-          <button
-            type="button"
-            onClick={clearChat}
-            disabled={working}
-            style={{
-              border: '1px solid rgba(128,128,128,0.35)',
-              borderRadius: 6,
-              background: 'transparent',
-              color: 'inherit',
-              padding: '6px 9px',
-              cursor: working ? 'default' : 'pointer',
-              opacity: working ? 0.5 : 0.8,
-            }}
-          >
-            New chat
-          </button>
+          <div style={{ display: 'grid', gap: 6, marginTop: 10, maxHeight: 150, overflowY: 'auto' }}>
+            {sessions.map((item) => (
+              <button
+                key={item.id}
+                type="button"
+                onClick={() => setSelectedSessionId(item.id)}
+                style={{
+                  display: 'grid',
+                  gridTemplateColumns: '1fr auto',
+                  gap: 8,
+                  textAlign: 'left',
+                  border: item.id === selectedSessionId ? '1px solid #5794f2' : '1px solid rgba(128,128,128,0.25)',
+                  borderRadius: 6,
+                  background: item.id === selectedSessionId ? 'rgba(87,148,242,0.12)' : 'transparent',
+                  color: 'inherit',
+                  padding: '8px 10px',
+                  cursor: 'pointer',
+                }}
+              >
+                <span style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{item.title}</span>
+                <span style={{ color: statusColor(item.status), fontSize: 11 }}>{item.status}</span>
+              </button>
+            ))}
+          </div>
         </div>
 
-        <div style={messagesStyle}>
-          {messages.map((message) => (
-            <MessageBubble key={message.id} message={message} />
-          ))}
+        <div style={{ padding: '12px 16px', borderBottom: '1px solid rgba(128,128,128,0.25)' }}>
+          <strong>{session?.title || 'Loading conversation…'}</strong>
+          <div style={{ fontSize: 12, opacity: 0.7, marginTop: 4 }}>
+            {working
+              ? `Working with ${latestJob?.model || 'local model'}… safe to leave this page`
+              : latestJob
+                ? `${latestJob.status} · ${latestJob.model || 'local model'}`
+                : 'Ready'}
+          </div>
+        </div>
+
+        <div style={messagesStyle} data-testid="chat-messages">
+          {!messages.length && !loading && (
+            <div style={{ opacity: 0.75 }}>
+              Tell me what you want to learn from the live data or which dashboard you want created.
+            </div>
+          )}
+          {messages.map((message) => <MessageBubble key={message.id} message={message} />)}
           {working && (
             <div style={{ display: 'flex', alignItems: 'center', gap: 8, opacity: 0.8 }}>
               <Spinner size={16} />
-              <span>{progress.length ? progress[progress.length - 1] : 'Starting local agent…'}</span>
+              <span>{latestJob?.progress?.length ? latestJob.progress[latestJob.progress.length - 1] : 'Starting local agent…'}</span>
             </div>
           )}
           <div ref={messageEndRef} />
         </div>
 
-        {progress.length > 0 && working && (
-          <details style={{ padding: '0 16px 10px' }}>
-            <summary style={{ cursor: 'pointer' }}>Agent progress ({progress.length})</summary>
+        {latestJob?.progress?.length ? (
+          <details style={{ padding: '0 16px 10px' }} open={working}>
+            <summary style={{ cursor: 'pointer' }}>Agent progress ({latestJob.progress.length})</summary>
             <pre style={{ maxHeight: 170, overflow: 'auto', fontSize: 11, whiteSpace: 'pre-wrap' }}>
-              {progress.slice(-15).join('\n')}
+              {latestJob.progress.slice(-15).join('\n')}
             </pre>
           </details>
-        )}
+        ) : null}
 
-        {error && (
+        {(error || latestJob?.error) && (
           <div style={{ padding: '0 16px 10px' }}>
-            <Alert title="AI request failed" severity="error">
-              {error}
+            <Alert title={latestJob?.status === 'interrupted' ? 'AI job interrupted' : 'AI request failed'} severity="error">
+              {error || latestJob?.error}
             </Alert>
+            {latestJob && ['failed', 'interrupted'].includes(latestJob.status) && (
+              <div style={{ marginTop: 8 }}><Button onClick={() => void retry()} disabled={submitting}>Retry</Button></div>
+            )}
           </div>
         )}
 
@@ -438,8 +487,8 @@ export default function App() {
             aria-label="Ask the Grafana AI"
             value={input}
             onChange={(event) => setInput(event.currentTarget.value)}
-            placeholder="e.g. Create a new dashboard for request rate, errors, p95 latency, CPU and memory…"
-            disabled={working || connected === false}
+            placeholder="e.g. Create a dashboard for request rate, errors, p95 latency, CPU and memory…"
+            disabled={working || connected === false || !selectedSessionId}
             style={inputStyle}
             onKeyDown={(event) => {
               if (event.key === 'Enter' && !event.shiftKey) {
@@ -449,10 +498,8 @@ export default function App() {
             }}
           />
           <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', gap: 12, marginTop: 10 }}>
-            <span style={{ fontSize: 11, opacity: 0.65 }}>
-              {working ? 'This job will keep running if you navigate away.' : 'Chat is saved in this browser.'}
-            </span>
-            <Button type="submit" disabled={working || !input.trim() || connected === false}>
+            <span style={{ fontSize: 11, opacity: 0.65 }}>Messages are stored server-side in SQLite.</span>
+            <Button type="submit" disabled={working || !input.trim() || connected === false || !selectedSessionId}>
               {working ? 'Working…' : 'Send'}
             </Button>
           </div>

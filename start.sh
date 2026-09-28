@@ -114,10 +114,32 @@ else
   uv run --no-sync python -c 'import httpx2, mcp, dotenv' >/dev/null 2>&1 || uv sync
 fi
 
-mkdir -p .run
+mkdir -p .run .state
 AI_PID_FILE=".run/ai-api.pid"
 AI_LOG_FILE=".run/ai-api.log"
+AI_CODE_FILE=".run/ai-api.code.sha256"
+AI_CODE_HASH="$(find agent -maxdepth 1 -type f -name '*.py' -print0 | sort -z | xargs -0 sha256sum | sha256sum | awk '{print $1}')"
 ai_api_ready() { curl -fsS --max-time 3 http://127.0.0.1:8010/health >/dev/null 2>&1; }
+
+restart_ai_bridge=0
+if [[ "${AI_BRIDGE_FORCE_RESTART:-0}" == "1" || ! -f "$AI_CODE_FILE" || "$(cat "$AI_CODE_FILE" 2>/dev/null || true)" != "$AI_CODE_HASH" ]]; then
+  restart_ai_bridge=1
+fi
+
+if [[ "$restart_ai_bridge" == "1" ]] && ai_api_ready; then
+  old_pid="$(cat "$AI_PID_FILE" 2>/dev/null || true)"
+  if [[ -z "$old_pid" || ! "$old_pid" =~ ^[0-9]+$ || ! -r "/proc/$old_pid/cmdline" ]] || \
+    ! tr '\0' ' ' <"/proc/$old_pid/cmdline" | grep -q 'agent.api'; then
+    die "AI bridge code changed, but the process on port 8010 is not owned by $AI_PID_FILE. Stop it explicitly and retry."
+  fi
+  echo "[start] Restarting the AI bridge to load changed code (persistent chats are kept)..."
+  kill "$old_pid" 2>/dev/null || true
+  for _ in $(seq 1 20); do
+    ai_api_ready || break
+    sleep 0.25
+  done
+  rm -f "$AI_PID_FILE"
+fi
 
 if ! ai_api_ready; then
   if [[ -f "$AI_PID_FILE" ]]; then
@@ -130,9 +152,9 @@ if ! ai_api_ready; then
   fi
   echo "[start] Starting host-side AI bridge on port 8010..."
   : > "$AI_LOG_FILE"
-  AI_API_HOST=0.0.0.0 AI_API_PORT=8010 \
+  AI_API_HOST=0.0.0.0 AI_API_PORT=8010 AI_CHAT_DB_PATH="${AI_CHAT_DB_PATH:-.state/ai-chat.sqlite3}" \
     AI_FAST_MODEL="${AI_FAST_MODEL:-$FAST_MODEL}" AI_DASHBOARD_MODEL="$DASHBOARD_MODEL" \
-    nohup uv run --no-sync python -m agent.api >>"$AI_LOG_FILE" 2>&1 &
+    nohup uv run --no-sync python -m agent.api </dev/null >>"$AI_LOG_FILE" 2>&1 &
   echo $! > "$AI_PID_FILE"
 fi
 
@@ -144,6 +166,7 @@ until ai_api_ready; do
   }
   sleep 1
 done
+printf '%s\n' "$AI_CODE_HASH" >"$AI_CODE_FILE"
 
 proxy_ready() {
   curl -fsS --max-time 5 -u admin:admin \
@@ -171,6 +194,7 @@ Demo API:      http://localhost:8000/scenario
 MCP:           http://127.0.0.1:8002/mcp
 AI bridge:     http://127.0.0.1:8010/health
 AI bridge log: .run/ai-api.log
+Chat database: .state/ai-chat.sqlite3
 
 Grafana UI:
 Open Grafana and choose "Create dashboard with AI" from the navigation/app page,

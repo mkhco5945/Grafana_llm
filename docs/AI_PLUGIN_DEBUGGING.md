@@ -1,55 +1,78 @@
-# Grafana AI plugin debugging
+# Grafana AI plugin debugging and persistence
 
-## Request flow
+## Architecture
 
 ```text
-browser
-  -> Grafana /api/plugin-proxy/mkhco-ai-dashboard-app/ai/*
-  -> plugin.json route "ai/*"
-  -> http://host.docker.internal:8010/*
-  -> host agent.api
-  -> Ollama + mcp-grafana
-  -> Grafana/Prometheus
+Grafana app (/a/mkhco-ai-dashboard-app)
+  -> Grafana plugin proxy (/api/plugin-proxy/mkhco-ai-dashboard-app/ai/*)
+  -> host agent.api (host.docker.internal:8010)
+  -> SQLite (.state/ai-chat.sqlite3)
+  -> Ollama + mcp-grafana -> Grafana/Prometheus
 ```
 
-The browser never calls port 8010 directly. Grafana 12.1.1 supports data-proxy routes for app plugins. Its route matcher treats `ai` as an exact path and `ai/*` as the prefix route that forwards `/health`, `/chat`, and `/jobs/...`. Grafana reads `plugin.json` into memory at startup, so `start.sh` restarts Grafana after a plugin build.
+The browser never calls port 8010 directly. Grafana 12.1.1 loads the app with `AppPlugin.setRootPage` and forwards the `ai/*` proxy route to the host bridge. `start.sh` rebuilds the plugin and restarts Grafana because plugin metadata is read at Grafana startup.
 
-Relevant upstream references:
+## Why “App not found” happened
 
-- [Grafana app-plugin proxy route guide](https://grafana.com/developers/plugin-tools/how-to-guides/app-plugins/add-authentication-for-app-plugins)
-- [Grafana 12.1.1 proxy matcher](https://github.com/grafana/grafana/blob/v12.1.1/pkg/api/pluginproxy/pluginproxy.go#L59-L98)
-- [Grafana 12.1.1 wildcard route tests](https://github.com/grafana/grafana/blob/v12.1.1/pkg/api/pluginproxy/pluginproxy_test.go#L284-L444)
+Grafana had valid plugin settings and the current `module.js` bytes execute successfully in Grafana 12.1.1. The failure was frontend artifact invalidation: all earlier bundles—including the broken automatic-JSX bundle that requested `/react/jsx-runtime`—advertised plugin version `0.1.0`. Grafana therefore requested every rewrite as `module.js?_cache=0.1.0`, and serves plugin assets with a one-hour public cache. A browser with a cached/rejected module import could keep rendering Grafana’s `App not found` fallback even while curl saw the new file and every backend check passed.
 
-## One-command checks
+The plugin version is now `0.2.0`, which changes Grafana’s module cache key. The bundle still uses the classic React transform, extension links use the Grafana-required `/a/<pluginId>/` form, and the page exposes `data-testid="ai-dashboard-builder-root"`. The headless Chrome check requires that marker, a successful `module.js?_cache=0.2.0` response, no `App not found`/`Page not found`, and no browser JavaScript exception.
 
-Run the complete, ordered smoke test:
+Relevant Grafana 12.1.1 source:
+
+- [App root loading and “App not found” fallback](https://github.com/grafana/grafana/blob/v12.1.1/public/app/features/plugins/components/AppRootPage.tsx)
+- [Plugin module version cache key](https://github.com/grafana/grafana/blob/v12.1.1/public/app/features/plugins/loader/cache.ts)
+- [`AppPlugin.setRootPage`](https://github.com/grafana/grafana/blob/v12.1.1/packages/grafana-data/src/types/app.ts)
+- [App proxy routes](https://grafana.com/developers/plugin-tools/how-to-guides/app-plugins/add-authentication-for-app-plugins)
+
+## Persistent conversations
+
+SQLite is the source of truth for sessions, messages, jobs, progress, results, errors, model names, and dashboard URLs. The frontend only uses localStorage for unsent drafts, the last selected session, and one-time migration bookkeeping.
+
+- `GET /sessions` lists chat history.
+- `POST /sessions` creates a new chat without deleting older chats.
+- `GET /sessions/{id}` restores messages and jobs.
+- `POST /sessions/{id}/chat` stores the user message and starts a durable job record.
+- `GET /jobs/{id}` reports persisted progress/results.
+- `POST /jobs/{id}/retry` retries a failed or interrupted saved request.
+
+Leaving the Grafana page does not stop the Python worker. Returning to the page reloads the session and resumes polling its active job. Completed answers are inserted with a unique job ID, preventing duplicate assistant messages.
+
+If the AI bridge process restarts, startup converts stale `queued`/`running` jobs to `interrupted`. The original request and prior messages remain, and the UI offers **Retry**. Completed conversations survive browser, Grafana, and bridge restarts.
+
+On first successful load, the frontend looks for `mkhco-ai-dashboard-app.chat.v1`, imports useful messages into one SQLite session, and marks migration complete. It does not delete or overwrite the old localStorage value. Browser localStorage cannot be recovered server-side if that browser no longer has it.
+
+## Validation and reports
+
+Run the complete smoke test:
 
 ```bash
 bash scripts/test_ai_plugin.sh
 ```
 
-It builds the plugin, starts/reloads the local stack, and tests registration, org settings, the frontend bundle, both network hops, the plugin proxy, and the app page. Any failure automatically runs the diagnostic collector.
+It verifies builds and checksums, registration/settings/proxy layers, SQLite APIs, a completed isolated conversation through the real local model/MCP worker, a safe AI-bridge restart, post-restart retrieval, New chat isolation, and the actual rendered app in headless Chrome. Test sessions use `[smoke-test]` titles and are the only sessions the cleanup endpoint permits deleting.
 
-Collect evidence without changing service configuration:
+Collect a mostly read-only report:
 
 ```bash
 bash scripts/diagnose_ai_plugin.sh
 ```
 
-The collector does run typecheck and webpack so it can prove the source is buildable. Otherwise it is read-only. It prints the path to a timestamped report under `.run/reports/`; `.run/reports/latest-ai-plugin` points to the newest report.
+Reports live under `.run/reports/ai-plugin-YYYYMMDD-HHMMSS/`, with `.run/reports/latest-ai-plugin` pointing to the newest report. `summary.md` identifies the first failed layer. Notable evidence:
 
-## Report layout
+- `build/`: typecheck/build output; metadata and module checksums; JSX-runtime check.
+- `docker/`: container state, mounts, Grafana version, and plugin files visible inside Grafana.
+- `frontend/render.json`: root marker, not-found signals, module response/cache status, and browser exceptions.
+- `network/`: exact status/headers/body for health, settings, module, proxy, and stats requests.
+- `state/sqlite-summary.json`: database existence, counts by status, and latest IDs/timestamps—never messages.
+- `logs/`: redacted Grafana/bridge errors.
 
-- `summary.md`: layer-by-layer PASS/FAIL, first failing layer, exact HTTP statuses, and an evidence-based likely cause.
-- `build/`: command output, source/built metadata, checksums/diff, and the `react/jsx-runtime` check.
-- `docker/`: container state, safe mount details, Grafana version, and files visible inside Grafana.
-- `network/`: separate status, response headers, body, and curl error files for each HTTP request.
-- `logs/`: filtered Grafana logs, recent service logs, and the host AI bridge log.
+The collector does not read `.env`, dump environments, or include chat messages/prompts. It redacts common authorization, cookie, password, and token formats.
 
-Common first failures are: build/imports, Grafana health, plugin registration, missing/disabled org settings, module serving, host bridge health, Grafana-container networking, route matching, and the app page. A proxy 404 with `plugin route match not found` means Grafana has no loaded matching route; compare all three `plugin.json` copies and restart Grafana. A proxy 500 with `plugin setting not found` is the separate org-settings problem.
+## Start, stop, and intentional deletion
 
-## Sharing reports safely
+`start.sh` never erases `.state/ai-chat.sqlite3`. It restarts the bridge only when bridge code changed or `AI_BRIDGE_FORCE_RESTART=1` is set. `stop.sh` stops processes but preserves chat history.
 
-The collector never reads `.env`, never dumps container/process environments, and redacts authorization headers, cookies, bearer tokens, and common password/token/secret fields. The generated `summary.md`, `build/`, `docker/`, `network/`, and `logs/` files are designed to be shareable with another engineer or AI after a quick human review.
+To intentionally erase all chat history, first run `./stop.sh`, then move `.state/ai-chat.sqlite3` and its `-wal`/`-shm` companions to a backup location or delete those three files explicitly. This is deliberately not part of either normal script.
 
-Never share `.env`, Grafana service-account tokens, `MCP_GRAFANA_SERVER_TOKEN`, `GRAFANA_MCP_SERVICE_ACCOUNT_TOKEN`, Authorization/Cookie headers, private keys, or raw environment dumps. Reports remain git-ignored under `.run/` and must not be committed.
+Never share `.env`, Grafana service-account tokens, `MCP_GRAFANA_SERVER_TOKEN`, `GRAFANA_MCP_SERVICE_ACCOUNT_TOKEN`, cookies, private keys, or raw environment dumps. `.state/` and `.run/` are git-ignored.

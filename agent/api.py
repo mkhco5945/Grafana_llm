@@ -5,33 +5,24 @@ import json
 import os
 import re
 import threading
-import time
-import uuid
-from dataclasses import asdict, dataclass, field, replace
+from dataclasses import replace
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
 from typing import Any
 
+from .chat_store import ChatStore
 from .config import Settings
 from .mcp_client import GrafanaMCPClient
 from .ollama_agent import OllamaAgent
 
 
-@dataclass
-class Job:
-    id: str
-    message: str
-    model: str
-    status: str = "queued"
-    progress: list[str] = field(default_factory=list)
-    answer: str = ""
-    error: str = ""
-    dashboard_url: str = ""
-    created_at: float = field(default_factory=time.time)
-    updated_at: float = field(default_factory=time.time)
+STORE: ChatStore | None = None
 
 
-JOBS: dict[str, Job] = {}
-JOBS_LOCK = threading.Lock()
+def _store() -> ChatStore:
+    if STORE is None:
+        raise RuntimeError("chat persistence is not initialized")
+    return STORE
 
 
 def _is_dashboard_write_request(message: str) -> bool:
@@ -91,78 +82,47 @@ def _extract_dashboard_url(answer: str) -> str:
     return ""
 
 
-def _job_progress(job_id: str, message: str) -> None:
-    with JOBS_LOCK:
-        job = JOBS.get(job_id)
-        if not job:
-            return
-        if not job.progress or job.progress[-1] != message:
-            job.progress.append(message)
-            job.progress = job.progress[-80:]
-        job.updated_at = time.time()
+async def _run_agent(job_id: str) -> None:
+    store = _store()
+    job = store.get_job(job_id)
+    message = store.get_job_message(job_id)
+    store.set_job_running(job_id)
 
-
-async def _run_agent(job_id: str, message: str, history: list[dict[str, Any]]) -> None:
-    settings = Settings.from_env()
-    model = _selected_model(message, settings)
-    settings = replace(settings, ollama_model=model)
-    with JOBS_LOCK:
-        job = JOBS[job_id]
-        job.model = model
-        job.status = "running"
-        job.updated_at = time.time()
-
-    prompt = _conversation_prompt(message, history)
     try:
+        settings = replace(Settings.from_env(), ollama_model=job["model"])
+        history = store.get_context(job["session_id"], job["user_message_id"], limit=10)
+        prompt = _conversation_prompt(message, history)
         async with GrafanaMCPClient(
             settings.mcp_grafana_url,
             settings.mcp_server_token,
             settings.mcp_timeout_seconds,
         ) as mcp:
-            agent = OllamaAgent(
-                settings,
-                mcp,
-                progress=lambda text: _job_progress(job_id, text),
-            )
+            agent = OllamaAgent(settings, mcp, progress=lambda text: store.append_progress(job_id, text))
             await agent.prepare()
             answer = await agent.run(prompt)
-        with JOBS_LOCK:
-            job = JOBS[job_id]
-            job.answer = answer
-            job.dashboard_url = _extract_dashboard_url(answer)
-            job.status = "completed"
-            job.updated_at = time.time()
+        store.complete_job(job_id, answer, _extract_dashboard_url(answer))
     except Exception as exc:
-        with JOBS_LOCK:
-            job = JOBS[job_id]
-            job.error = str(exc)
-            job.status = "failed"
-            job.updated_at = time.time()
+        store.fail_job(job_id, str(exc))
 
 
-def _start_job(message: str, history: list[dict[str, Any]]) -> Job:
-    settings = Settings.from_env()
-    job_id = uuid.uuid4().hex
-    job = Job(id=job_id, message=message, model=_selected_model(message, settings))
-    with JOBS_LOCK:
-        JOBS[job_id] = job
+def _launch_job(job_id: str) -> None:
     thread = threading.Thread(
-        target=lambda: asyncio.run(_run_agent(job_id, message, history)),
+        target=lambda: asyncio.run(_run_agent(job_id)),
         name=f"ai-job-{job_id[:8]}",
         daemon=True,
     )
     thread.start()
+
+
+def _start_job(session_id: str, message: str) -> dict[str, Any]:
+    model = _selected_model(message, Settings.from_env())
+    job = _store().create_job(session_id, message, model)
+    _launch_job(job["id"])
     return job
 
 
-def _job_dict(job: Job) -> dict[str, Any]:
-    payload = asdict(job)
-    payload["progress"] = list(job.progress)
-    return payload
-
-
 class Handler(BaseHTTPRequestHandler):
-    server_version = "GrafanaLocalAI/0.1"
+    server_version = "GrafanaLocalAI/0.2"
 
     def _json(self, status: int, payload: Any) -> None:
         raw = json.dumps(payload, ensure_ascii=False).encode()
@@ -182,50 +142,82 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_GET(self) -> None:
         path = self.path.split("?", 1)[0]
-        if path == "/health":
-            self._json(200, {"ok": True, "service": "grafana-local-ai"})
-            return
-        match = re.fullmatch(r"/jobs/([A-Fa-f0-9]+)", path)
-        if match:
-            with JOBS_LOCK:
-                job = JOBS.get(match.group(1))
-                payload = _job_dict(job) if job else None
-            if payload is None:
-                self._json(404, {"error": "job not found"})
-            else:
-                self._json(200, payload)
-            return
-        self._json(404, {"error": "not found"})
+        try:
+            if path == "/health":
+                self._json(200, {"ok": True, "service": "grafana-local-ai", "database": "ok"})
+                return
+            if path == "/stats":
+                self._json(200, _store().stats())
+                return
+            if path == "/sessions":
+                self._json(200, {"sessions": _store().list_sessions()})
+                return
+            session_match = re.fullmatch(r"/sessions/([A-Fa-f0-9]+)", path)
+            if session_match:
+                self._json(200, _store().get_session(session_match.group(1)))
+                return
+            job_match = re.fullmatch(r"/jobs/([A-Fa-f0-9]+)", path)
+            if job_match:
+                self._json(200, _store().get_job(job_match.group(1)))
+                return
+            self._json(404, {"error": "not found"})
+        except KeyError as exc:
+            self._json(404, {"error": str(exc).strip("'")})
+        except Exception as exc:
+            self._json(500, {"error": str(exc)})
 
     def do_POST(self) -> None:
         path = self.path.split("?", 1)[0]
-        if path != "/chat":
-            self._json(404, {"error": "not found"})
-            return
         try:
             payload = self._read_json()
             if not isinstance(payload, dict):
                 raise ValueError("body must be an object")
-            message = str(payload.get("message") or "").strip()
-            if not message:
-                raise ValueError("message is required")
-            if len(message) > 20_000:
-                raise ValueError("message is too long")
-            history = payload.get("history") or []
-            if not isinstance(history, list):
-                raise ValueError("history must be an array")
-            history = [item for item in history if isinstance(item, dict)][-10:]
-            job = _start_job(message, history)
-            self._json(
-                202,
-                {
-                    "job_id": job.id,
-                    "status": job.status,
-                    "model": job.model,
-                },
-            )
+            if path == "/sessions":
+                title = payload.get("title")
+                if title is not None and not isinstance(title, str):
+                    raise ValueError("title must be a string")
+                self._json(201, _store().create_session(title))
+                return
+            if path == "/sessions/import":
+                source = str(payload.get("source") or "").strip()
+                session, already_imported = _store().import_legacy(source, payload)
+                self._json(200 if already_imported else 201, {"session": session, "already_imported": already_imported})
+                return
+            chat_match = re.fullmatch(r"/sessions/([A-Fa-f0-9]+)/chat", path)
+            if chat_match:
+                message = str(payload.get("message") or "").strip()
+                if not message:
+                    raise ValueError("message is required")
+                if len(message) > 20_000:
+                    raise ValueError("message is too long")
+                job = _start_job(chat_match.group(1), message)
+                self._json(202, {"job_id": job["id"], "status": job["status"], "model": job["model"]})
+                return
+            retry_match = re.fullmatch(r"/jobs/([A-Fa-f0-9]+)/retry", path)
+            if retry_match:
+                job = _store().retry_job(retry_match.group(1))
+                _launch_job(job["id"])
+                self._json(202, {"job_id": job["id"], "status": job["status"], "model": job["model"]})
+                return
+            self._json(404, {"error": "not found"})
         except (ValueError, json.JSONDecodeError) as exc:
             self._json(400, {"error": str(exc)})
+        except KeyError as exc:
+            self._json(404, {"error": str(exc).strip("'")})
+        except Exception as exc:
+            self._json(500, {"error": str(exc)})
+
+    def do_DELETE(self) -> None:
+        path = self.path.split("?", 1)[0]
+        match = re.fullmatch(r"/sessions/([A-Fa-f0-9]+)", path)
+        if not match:
+            self._json(404, {"error": "not found"})
+            return
+        try:
+            deleted = _store().delete_smoke_session(match.group(1))
+            self._json(200 if deleted else 404, {"deleted": deleted})
+        except ValueError as exc:
+            self._json(403, {"error": str(exc)})
         except Exception as exc:
             self._json(500, {"error": str(exc)})
 
@@ -234,10 +226,19 @@ class Handler(BaseHTTPRequestHandler):
 
 
 def main() -> None:
+    global STORE
     host = os.getenv("AI_API_HOST", "0.0.0.0")
     port = int(os.getenv("AI_API_PORT", "8010"))
     Settings.from_env()
+    database_path = Path(os.getenv("AI_CHAT_DB_PATH", ".state/ai-chat.sqlite3"))
+    STORE = ChatStore(database_path)
     server = ThreadingHTTPServer((host, port), Handler)
+    # Bind first: a mistakenly launched second bridge must not mark jobs owned by
+    # the healthy process as interrupted.
+    interrupted = STORE.interrupt_stale_jobs()
+    print(f"[ai-api] chat database: {database_path.resolve()}", flush=True)
+    if interrupted:
+        print(f"[ai-api] marked {interrupted} stale job(s) interrupted", flush=True)
     print(f"[ai-api] listening on http://{host}:{port}", flush=True)
     try:
         server.serve_forever()

@@ -3,28 +3,67 @@ import { lastValueFrom } from 'rxjs';
 
 const BASE = '/api/plugin-proxy/mkhco-ai-dashboard-app/ai';
 
-export type ChatHistoryItem = {
+export type JobStatus = 'queued' | 'running' | 'completed' | 'failed' | 'interrupted';
+
+export type ChatMessage = {
+  id: string;
+  session_id: string;
   role: 'user' | 'assistant';
   content: string;
-};
-
-export type StartJobResponse = {
+  created_at: number;
   job_id: string;
-  status: string;
-  model: string;
 };
 
 export type JobResponse = {
   id: string;
-  status: 'queued' | 'running' | 'completed' | 'failed';
+  session_id: string;
+  user_message_id: string;
+  status: JobStatus;
   model: string;
   progress: string[];
   answer: string;
   error: string;
   dashboard_url: string;
+  created_at: number;
+  updated_at: number;
 };
 
-async function request<T>(options: { url: string; method?: 'GET' | 'POST'; data?: unknown }): Promise<T> {
+export type SessionSummary = {
+  id: string;
+  title: string;
+  created_at: number;
+  updated_at: number;
+  status: JobStatus | 'idle';
+  model: string;
+  active_job_id: string;
+};
+
+export type SessionDetail = {
+  id: string;
+  title: string;
+  created_at: number;
+  updated_at: number;
+  messages: ChatMessage[];
+  jobs: JobResponse[];
+  active_job: JobResponse | null;
+};
+
+export type StartJobResponse = {
+  job_id: string;
+  status: JobStatus;
+  model: string;
+};
+
+export type LegacyChatState = {
+  messages: Array<{ id?: string; role?: string; content?: string }>;
+  model?: string;
+  progress?: string[];
+  error?: string;
+  dashboardUrl?: string;
+  activeJobId?: string;
+};
+
+async function request<T>(options: { url: string; method?: 'GET' | 'POST' | 'DELETE'; data?: unknown }): Promise<T> {
   const response = await lastValueFrom(
     getBackendSrv().fetch<T>({
       url: options.url,
@@ -35,15 +74,28 @@ async function request<T>(options: { url: string; method?: 'GET' | 'POST'; data?
   return response.data;
 }
 
-export async function health(): Promise<{ ok: boolean; service: string }> {
+export async function health(): Promise<{ ok: boolean; service: string; database: string }> {
   return request({ url: `${BASE}/health` });
 }
 
-export async function startChat(message: string, history: ChatHistoryItem[]): Promise<StartJobResponse> {
+export async function listSessions(): Promise<SessionSummary[]> {
+  const result = await request<{ sessions: SessionSummary[] }>({ url: `${BASE}/sessions` });
+  return result.sessions;
+}
+
+export async function createSession(title?: string): Promise<SessionDetail> {
+  return request({ url: `${BASE}/sessions`, method: 'POST', data: title ? { title } : {} });
+}
+
+export async function getSession(sessionId: string): Promise<SessionDetail> {
+  return request({ url: `${BASE}/sessions/${sessionId}` });
+}
+
+export async function startChat(sessionId: string, message: string): Promise<StartJobResponse> {
   return request({
-    url: `${BASE}/chat`,
+    url: `${BASE}/sessions/${sessionId}/chat`,
     method: 'POST',
-    data: { message, history },
+    data: { message },
   });
 }
 
@@ -51,19 +103,14 @@ export async function getJob(jobId: string): Promise<JobResponse> {
   return request({ url: `${BASE}/jobs/${jobId}` });
 }
 
-export async function waitForJob(
-  jobId: string,
-  onProgress: (job: JobResponse) => void,
-  timeoutMs = 20 * 60 * 1000
-): Promise<JobResponse> {
-  const started = Date.now();
-  while (Date.now() - started < timeoutMs) {
-    const job = await getJob(jobId);
-    onProgress(job);
-    if (job.status === 'completed' || job.status === 'failed') {
-      return job;
-    }
-    await new Promise((resolve) => window.setTimeout(resolve, 1000));
-  }
-  throw new Error('AI request timed out. Check the local AI API log.');
+export async function retryJob(jobId: string): Promise<StartJobResponse> {
+  return request({ url: `${BASE}/jobs/${jobId}/retry`, method: 'POST', data: {} });
+}
+
+export async function importLegacyChat(state: LegacyChatState): Promise<{ session: SessionDetail; already_imported: boolean }> {
+  return request({
+    url: `${BASE}/sessions/import`,
+    method: 'POST',
+    data: { source: 'mkhco-ai-dashboard-app.chat.v1', ...state },
+  });
 }

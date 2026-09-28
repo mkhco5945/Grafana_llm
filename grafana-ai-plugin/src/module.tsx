@@ -5,7 +5,9 @@ import { AppPlugin, PluginExtensionPoints } from '@grafana/data';
 import App from './App';
 import pluginJson from './plugin.json';
 
-const appPath = `/a/${pluginJson.id}`;
+// Grafana 12.1 validates extension links as children of /a/<pluginId>/.
+// The root component still handles both the slash and non-slash app URLs.
+const appPath = `/a/${pluginJson.id}/`;
 
 export const plugin = new AppPlugin<{}>()
   .setRootPage(App)
