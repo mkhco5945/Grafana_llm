@@ -43,19 +43,21 @@ if ! model_installed "$FAST_MODEL"; then
 fi
 export AI_DASHBOARD_MODEL="$DASHBOARD_MODEL"
 
-echo "[start] Building Grafana AI app plugin locally with Node $(node --version)..."
-pushd grafana-ai-plugin >/dev/null
-if [[ ! -x node_modules/.bin/webpack || ! -x node_modules/.bin/tsc ]]; then
-  echo "[start] Installing Grafana plugin npm dependencies using the host network/proxy settings..."
-  if [[ -f package-lock.json ]]; then
-    npm ci --no-audit --no-fund || die "npm ci for grafana-ai-plugin failed. Your shell HTTP(S)_PROXY settings are used automatically by npm."
-  else
-    npm install --no-audit --no-fund || die "npm install for grafana-ai-plugin failed. Your shell HTTP(S)_PROXY settings are used automatically by npm."
+if [[ "${AI_PLUGIN_ALREADY_BUILT:-0}" != "1" ]]; then
+  echo "[start] Building Grafana AI app plugin locally with Node $(node --version)..."
+  pushd grafana-ai-plugin >/dev/null
+  if [[ ! -x node_modules/.bin/webpack || ! -x node_modules/.bin/tsc ]]; then
+    echo "[start] Installing Grafana plugin npm dependencies using the host network/proxy settings..."
+    if [[ -f package-lock.json ]]; then
+      npm ci --no-audit --no-fund || die "npm ci for grafana-ai-plugin failed. Your shell HTTP(S)_PROXY settings are used automatically by npm."
+    else
+      npm install --no-audit --no-fund || die "npm install for grafana-ai-plugin failed. Your shell HTTP(S)_PROXY settings are used automatically by npm."
+    fi
   fi
+  npm run typecheck || die "Grafana AI plugin typecheck failed."
+  npm run build || die "Grafana AI plugin build failed."
+  popd >/dev/null
 fi
-npm run typecheck || die "Grafana AI plugin typecheck failed."
-npm run build || die "Grafana AI plugin build failed."
-popd >/dev/null
 [[ -f grafana-ai-plugin/dist/module.js ]] || die "Grafana AI plugin build did not produce dist/module.js."
 
 echo "[start] Starting Grafana, Prometheus, demo exporter, and MCP..."
@@ -64,6 +66,12 @@ if ! docker compose up -d --build; then
   docker compose logs --no-color --tail=160 grafana >&2 || true
   die "Local stack startup failed."
 fi
+
+# Grafana reads plugin.json (including proxy routes) only during startup. The
+# bind-mounted bundle can change without Compose recreating the container, so a
+# restart is required after every local metadata build.
+echo "[start] Reloading Grafana plugin metadata..."
+docker compose restart grafana >/dev/null || die "Could not restart Grafana after the plugin build."
 
 container_health() {
   local service="$1" id status
@@ -141,15 +149,17 @@ proxy_ready() {
   curl -fsS --max-time 5 -u admin:admin \
     http://127.0.0.1:3000/api/plugin-proxy/mkhco-ai-dashboard-app/ai/health >/dev/null 2>&1
 }
-proxy_deadline=$((SECONDS + 30))
-until proxy_ready; do
-  (( SECONDS < proxy_deadline )) || {
-    echo "[start] Grafana is up, but the AI app proxy is not reachable yet." >&2
-    docker compose logs --no-color --tail=120 grafana >&2 || true
-    die "AI Dashboard Builder plugin/proxy verification failed."
-  }
-  sleep 1
-done
+if [[ "${AI_PLUGIN_SKIP_PROXY_CHECK:-0}" != "1" ]]; then
+  proxy_deadline=$((SECONDS + 30))
+  until proxy_ready; do
+    (( SECONDS < proxy_deadline )) || {
+      echo "[start] Grafana is up, but the AI app proxy is not reachable yet." >&2
+      docker compose logs --no-color --tail=120 grafana >&2 || true
+      die "AI Dashboard Builder plugin/proxy verification failed."
+    }
+    sleep 1
+  done
+fi
 
 cat <<'SUMMARY'
 
