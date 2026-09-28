@@ -10,6 +10,10 @@ command -v ollama >/dev/null 2>&1 || die "Ollama is not installed or not on PATH
 command -v docker >/dev/null 2>&1 || die "Docker is not installed or not on PATH."
 command -v curl >/dev/null 2>&1 || die "curl is required."
 command -v uv >/dev/null 2>&1 || die "uv is required for the Python agent."
+command -v node >/dev/null 2>&1 || die "Node.js >=22 is required to build the local Grafana app plugin."
+command -v npm >/dev/null 2>&1 || die "npm is required to build the local Grafana app plugin."
+node -e 'const major=Number(process.versions.node.split(".")[0]); if (major < 22) process.exit(1)' \
+  || die "Node.js >=22 is required; current version is $(node --version)."
 
 if [[ ! -f .env ]]; then
   die "Missing .env. Copy .env.example to .env and configure the existing Grafana/MCP tokens."
@@ -39,11 +43,22 @@ if ! model_installed "$FAST_MODEL"; then
 fi
 export AI_DASHBOARD_MODEL="$DASHBOARD_MODEL"
 
-echo "[start] Starting Grafana, Prometheus, demo exporter, MCP, and building the AI app plugin..."
+echo "[start] Building Grafana AI app plugin locally with Node $(node --version)..."
+pushd grafana-ai-plugin >/dev/null
+if [[ ! -x node_modules/.bin/webpack || ! -x node_modules/.bin/tsc ]]; then
+  echo "[start] Installing Grafana plugin npm dependencies using the host network/proxy settings..."
+  npm install --no-audit --no-fund || die "npm install for grafana-ai-plugin failed. Your shell HTTP(S)_PROXY settings are used automatically by npm."
+fi
+npm run typecheck || die "Grafana AI plugin typecheck failed."
+npm run build || die "Grafana AI plugin build failed."
+popd >/dev/null
+[[ -f grafana-ai-plugin/dist/module.js ]] || die "Grafana AI plugin build did not produce dist/module.js."
+
+echo "[start] Starting Grafana, Prometheus, demo exporter, and MCP..."
 if ! docker compose up -d --build; then
-  echo "[start] Docker Compose startup failed. Relevant logs:" >&2
-  docker compose logs --no-color --tail=160 ai-plugin-build grafana >&2 || true
-  die "Local stack/plugin build failed."
+  echo "[start] Docker Compose startup failed. Relevant Grafana logs:" >&2
+  docker compose logs --no-color --tail=160 grafana >&2 || true
+  die "Local stack startup failed."
 fi
 
 container_health() {
@@ -59,7 +74,7 @@ deadline=$((SECONDS + 180))
 until container_health grafana && container_health prometheus && container_health demo && container_health mcp-grafana && ollama_ready; do
   (( SECONDS < deadline )) || {
     docker compose ps >&2 || true
-    docker compose logs --no-color --tail=120 ai-plugin-build grafana >&2 || true
+    docker compose logs --no-color --tail=120 grafana >&2 || true
     die "Timed out waiting for the local stack."
   }
   sleep 2
@@ -111,7 +126,7 @@ proxy_deadline=$((SECONDS + 30))
 until proxy_ready; do
   (( SECONDS < proxy_deadline )) || {
     echo "[start] Grafana is up, but the AI app proxy is not reachable yet." >&2
-    docker compose logs --no-color --tail=120 grafana ai-plugin-build >&2 || true
+    docker compose logs --no-color --tail=120 grafana >&2 || true
     die "AI Dashboard Builder plugin/proxy verification failed."
   }
   sleep 1
