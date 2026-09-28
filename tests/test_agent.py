@@ -1,4 +1,5 @@
 import unittest
+import json
 from types import SimpleNamespace
 
 from agent.mcp_client import (
@@ -74,9 +75,25 @@ class FakeMCP:
         return SimpleNamespace(is_error=False, structured_content={"ok": True}, content=[])
 
 
+class FailingMCP(FakeMCP):
+    def __init__(self, failing_names=None):
+        super().__init__()
+        self.failing_names = set(failing_names or ())
+
+    async def call_tool(self, name, arguments):
+        self.calls.append((name, arguments))
+        if name in self.failing_names and sum(call[0] == name for call in self.calls) == 1:
+            return SimpleNamespace(
+                is_error=True,
+                structured_content=None,
+                content=[SimpleNamespace(type="text", text="bad_data: test failure")],
+            )
+        return SimpleNamespace(is_error=False, structured_content={"ok": True}, content=[])
+
+
 class AgentLoopTests(unittest.IsolatedAsyncioTestCase):
     @staticmethod
-    def _settings(max_turns=2):
+    def _settings(max_turns=2, max_prewrite_turns=8):
         return SimpleNamespace(
             max_tool_turns=max_turns,
             max_tool_result_chars=60000,
@@ -87,6 +104,7 @@ class AgentLoopTests(unittest.IsolatedAsyncioTestCase):
             ollama_num_predict=64,
             ollama_temperature=0,
             demo_scrape_wait_seconds=0,
+            max_prewrite_turns=max_prewrite_turns,
         )
 
     @staticmethod
@@ -144,7 +162,7 @@ class AgentLoopTests(unittest.IsolatedAsyncioTestCase):
 
         with self.assertRaisesRegex(OllamaError, "Maximum tool-turn limit"):
             await agent.run("loop forever")
-        self.assertEqual(len(mcp.calls), 2)
+        self.assertEqual(len(mcp.calls), 1)
 
     async def test_local_tool_is_dispatched_without_mcp(self):
         responses = iter([
@@ -173,6 +191,127 @@ class AgentLoopTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result, "changed")
         self.assertEqual(agent.demo.calls, [("set_demo_scenario_preset", {"name": "high-errors"})])
         self.assertEqual(mcp.calls, [])
+
+    async def test_identical_failed_call_is_blocked_and_recovery_continues(self):
+        bad_args = {"datasourceUid": "prometheus", "labelName": "job"}
+        responses = iter(
+            [
+                self._tool_call(name="list_prometheus_label_values", arguments=bad_args),
+                self._tool_call(name="list_prometheus_label_values", arguments=bad_args),
+                self._tool_call(name="query_prometheus", arguments={"datasourceUid": "prometheus", "expr": "up", "endTime": "now"}),
+                self._tool_call(name="update_dashboard", arguments={"dashboard": {"title": "recovered"}}),
+                {"message": {"role": "assistant", "content": "created"}},
+            ]
+        )
+
+        async def request(_payload):
+            return next(responses)
+
+        mcp = FailingMCP({"list_prometheus_label_values"})
+        agent = OllamaAgent(self._settings(max_turns=6), mcp, ollama_request=request, progress=lambda _: None)
+        agent.tools = [{"type": "function"}]
+        agent.mcp_tool_names = {"list_prometheus_label_values", "query_prometheus", "update_dashboard"}
+        agent.tool_names = set(agent.mcp_tool_names)
+
+        self.assertEqual(await agent.run("recover"), "created")
+        self.assertEqual([call[0] for call in mcp.calls], [
+            "list_prometheus_label_values", "query_prometheus", "update_dashboard"
+        ])
+        repeated_result = json.loads(agent.messages[-6]["content"])
+        self.assertEqual(repeated_result["error"], "REPEATED_FAILED_TOOL_CALL")
+
+    async def test_failed_call_tracking_resets_between_runs(self):
+        responses = iter(
+            [
+                self._tool_call(name="list_datasources"),
+                {"message": {"role": "assistant", "content": "first"}},
+                self._tool_call(name="list_datasources"),
+                {"message": {"role": "assistant", "content": "second"}},
+            ]
+        )
+
+        async def request(_payload):
+            return next(responses)
+
+        mcp = FailingMCP({"list_datasources"})
+        agent = OllamaAgent(self._settings(max_turns=2), mcp, ollama_request=request, progress=lambda _: None)
+        agent.tools = [{"type": "function"}]
+        agent.mcp_tool_names = {"list_datasources"}
+        agent.tool_names = set(agent.mcp_tool_names)
+        self.assertEqual(await agent.run("first"), "first")
+        self.assertEqual(await agent.run("second"), "second")
+        self.assertEqual([call[0] for call in mcp.calls], ["list_datasources", "list_datasources"])
+
+    def test_live_schema_validation_rejects_before_mcp(self):
+        agent = OllamaAgent.__new__(OllamaAgent)
+        agent.local_tool_names = set()
+        agent._all_mcp_tools = {
+            "query_prometheus": FakeTool(
+                "query_prometheus",
+                schema={
+                    "type": "object",
+                    "required": ["datasourceUid", "expr", "endTime"],
+                    "properties": {"datasourceUid": {"type": "string"}, "expr": {"type": "string"}, "endTime": {"type": "string"}},
+                    "additionalProperties": False,
+                },
+            )
+        }
+        self.assertIn("required property", agent._validate_tool_arguments("query_prometheus", {"expr": "up"}))
+
+    def test_label_matcher_enum_is_validated(self):
+        agent = OllamaAgent.__new__(OllamaAgent)
+        agent.local_tool_names = set()
+        agent._all_mcp_tools = {}
+        error = agent._validate_tool_arguments(
+            "list_prometheus_label_values",
+            {"datasourceUid": "prometheus", "labelName": "job", "matches": [{"filters": [{"name": "job", "type": '=\\"', "value": "demo"}]}]},
+        )
+        self.assertIn("must be one of", error)
+
+    async def test_ollama_length_diagnostic_is_specific(self):
+        async def request(_payload):
+            return {
+                "done": True,
+                "done_reason": "length",
+                "eval_count": 64,
+                "message": {"role": "assistant", "content": "", "thinking": "x" * 12},
+            }
+
+        agent = OllamaAgent(self._settings(max_turns=1), FakeMCP(), ollama_request=request, progress=lambda _: None)
+        agent.tools = [{"type": "function"}]
+        agent.mcp_tool_names = {"list_datasources"}
+        with self.assertRaisesRegex(OllamaError, "length limit"):
+            await agent.run("empty")
+
+    async def test_prewrite_discovery_budget_blocks_early(self):
+        mcp = FakeMCP()
+        agent = OllamaAgent(self._settings(max_turns=20), mcp, progress=lambda _: None)
+        args = {"datasourceUid": "prometheus"}
+        for _ in range(2):
+            fp = agent.tool_call_fingerprint("list_prometheus_metric_names", args)
+            await agent._dispatch_tool_call("list_prometheus_metric_names", args, fp)
+        fp = agent.tool_call_fingerprint("list_prometheus_metric_names", {**args, "page": 2})
+        result = json.loads(await agent._dispatch_tool_call("list_prometheus_metric_names", {**args, "page": 2}, fp))
+        self.assertIn(result["error"], {"DISCOVERY_CALL_BUDGET_EXCEEDED", "REPEATED_TOOL_PATTERN"})
+        self.assertEqual(len(mcp.calls), 1)
+
+    async def test_repetitive_tool_loop_stops_before_turn_limit(self):
+        async def request(_payload):
+            # Tiny argument changes should not buy the model twenty remote turns.
+            page = sum(1 for message in agent.messages if message.get("role") == "tool") + 1
+            return self._tool_call(
+                name="list_prometheus_metric_names",
+                arguments={"datasourceUid": "prometheus", "page": page},
+            )
+
+        mcp = FakeMCP()
+        agent = OllamaAgent(self._settings(max_turns=20), mcp, ollama_request=request, progress=lambda _: None)
+        agent.tools = [{"type": "function"}]
+        agent.mcp_tool_names = {"list_prometheus_metric_names"}
+        agent.tool_names = set(agent.mcp_tool_names)
+        with self.assertRaisesRegex(OllamaError, "stuck in repetitive tool calls"):
+            await agent.run("loop")
+        self.assertLess(agent.inference_turns, 20)
 
     async def test_demo_client_dispatches_to_specific_api_endpoint(self):
         client = DemoScenarioClient("http://demo.invalid")

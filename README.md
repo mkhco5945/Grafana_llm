@@ -116,8 +116,11 @@ The required caller token and configurable runtime values live in `.env`. See [.
 | `OLLAMA_NUM_PREDICT` | `2048` |
 | `OLLAMA_THINKING` | `false` |
 | `AGENT_MAX_TOOL_TURNS` | `20` |
+| `AGENT_MAX_SAME_TOOL_FAILURES` | `2` |
+| `AGENT_MAX_PREWRITE_RECOVERY_BLOCKS` | `3` |
+| `AGENT_MAX_PREWRITE_TURNS` | `8` for dashboard requests |
 
-The agent discovers all 81 MCP tools but starts by exposing twelve read-only datasource, Prometheus, and dashboard-inspection tools. After it validates a PromQL query, it unlocks the mutating `update_dashboard` tool, completing this explicit 13-tool allowlist:
+The agent discovers all 81 MCP tools but starts by exposing a lean read-only datasource, Prometheus, and dashboard-inspection set. Label tools are added for label-focused prompts. After it validates a PromQL query, it unlocks the mutating `update_dashboard` tool, completing this explicit allowlist:
 
 - `list_datasources`, `get_datasource`, `check_datasources_health`
 - `list_prometheus_metric_names`, `list_prometheus_label_names`, `list_prometheus_label_values`

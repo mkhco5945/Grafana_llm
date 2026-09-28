@@ -28,6 +28,9 @@ class Settings:
     ollama_temperature: float
     ollama_thinking: bool
     max_tool_turns: int
+    max_same_tool_failures: int
+    max_prewrite_recovery_blocks: int
+    max_prewrite_turns: int
     max_tool_result_chars: int
     demo_api_timeout_seconds: float
     demo_scrape_wait_seconds: float
@@ -56,6 +59,15 @@ class Settings:
             ollama_temperature=float(os.getenv("OLLAMA_TEMPERATURE", "0.2")),
             ollama_thinking=_env_bool("OLLAMA_THINKING", False),
             max_tool_turns=int(os.getenv("AGENT_MAX_TOOL_TURNS", "20")),
+            max_same_tool_failures=max(
+                1, int(os.getenv("AGENT_MAX_SAME_TOOL_FAILURES", "2"))
+            ),
+            max_prewrite_recovery_blocks=max(
+                1, int(os.getenv("AGENT_MAX_PREWRITE_RECOVERY_BLOCKS", "3"))
+            ),
+            max_prewrite_turns=max(
+                1, int(os.getenv("AGENT_MAX_PREWRITE_TURNS", "8"))
+            ),
             max_tool_result_chars=int(
                 os.getenv("AGENT_MAX_TOOL_RESULT_CHARS", "60000")
             ),

@@ -234,6 +234,7 @@ version = "0.1.0"
 source = { virtual = "." }
 dependencies = [
     { name = "httpx2" },
+    { name = "jsonschema" },
     { name = "mcp" },
     { name = "python-dotenv" },
 ]
@@ -241,6 +242,7 @@ dependencies = [
 [package.metadata]
 requires-dist = [
     { name = "httpx2", specifier = ">=2.5.0,<3" },
+    { name = "jsonschema", specifier = ">=4.0,<5" },
     { name = "mcp", specifier = "==2.2.0" },
     { name = "python-dotenv", specifier = ">=1.0.1,<2" },
 ]

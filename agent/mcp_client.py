@@ -27,14 +27,12 @@ ALLOWED_TOOL_NAMES = frozenset(
     }
 )
 
-DISCOVERY_TOOL_NAMES = frozenset(
+CORE_DISCOVERY_TOOL_NAMES = frozenset(
     {
         "list_datasources",
         "get_datasource",
         "check_datasources_health",
         "list_prometheus_metric_names",
-        "list_prometheus_label_names",
-        "list_prometheus_label_values",
         "query_prometheus",
         "query_prometheus_histogram",
         "search_dashboards",
@@ -43,6 +41,15 @@ DISCOVERY_TOOL_NAMES = frozenset(
         "get_dashboard_panel_queries",
     }
 )
+
+LABEL_DISCOVERY_TOOL_NAMES = frozenset(
+    {"list_prometheus_label_names", "list_prometheus_label_values"}
+)
+
+# Kept as a compatibility name for callers that want the complete read-only
+# discovery phase. Ordinary requests use CORE_DISCOVERY_TOOL_NAMES and opt in
+# to label tools only when label discovery is relevant.
+DISCOVERY_TOOL_NAMES = CORE_DISCOVERY_TOOL_NAMES | LABEL_DISCOVERY_TOOL_NAMES
 
 
 def _dump_model(value: Any) -> Any:
@@ -88,7 +95,18 @@ def serialize_mcp_result(result: Any, max_chars: int = 60000) -> str:
     for item in getattr(result, "content", []) or []:
         item_dump = _dump_model(item)
         if isinstance(item_dump, dict) and item_dump.get("type") == "text":
-            content.append(item_dump.get("text", ""))
+            text = item_dump.get("text", "")
+            # mcp-grafana commonly returns a JSON array/object encoded in a
+            # text content block. Preserve plain text and errors verbatim, but
+            # expose successful structured values as JSON so small models do
+            # not have to parse a second encoding layer.
+            if isinstance(text, str):
+                try:
+                    content.append(json.loads(text))
+                except json.JSONDecodeError:
+                    content.append(text)
+            else:
+                content.append(text)
         else:
             content.append(item_dump)
     payload = {
