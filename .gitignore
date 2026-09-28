@@ -2,6 +2,9 @@
 .env.*
 !.env.example
 .venv/
+.run/
 __pycache__/
 *.py[cod]
 .pytest_cache/
+grafana-ai-plugin/node_modules/
+grafana-ai-plugin/dist/
