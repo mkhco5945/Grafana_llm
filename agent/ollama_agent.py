@@ -38,7 +38,8 @@ Rules:
 - Validate important PromQL queries with query_prometheus before creating or updating a dashboard.
 - Create or update dashboards only with update_dashboard. Prefer a useful, simple dashboard with clear units and legends.
 - For an existing dashboard, use update_dashboard patch mode with its uid and operations; do not send a full replacement dashboard object that can carry a stale version.
-- When dashboard retrieval returns a patch_path for a saved panel query, use that exact path; legacy dashboards may nest panels below another dashboard object.
+- MCP dashboard responses wrap the actual Grafana dashboard document. update_dashboard patch paths are always relative to that actual document; use $.panels, never $.dashboard.panels from a response envelope.
+- A renderable classic dashboard stores complete panel objects directly in its top-level panels array. Every panel needs a unique numeric id, title, visualization type, positive gridPos, Prometheus datasource, target PromQL, and an appropriate unit.
 - For rates derived from counters, use rate(); for histogram percentiles, use the _bucket series with rate() and aggregate by le. Reuse the exact validated expressions in panel targets.
 - A panel named Request Rate must use rate() or irate() over a counter. An Error Percentage panel must divide an error rate by a request rate and scale the ratio to percent. Raw _total counters do not satisfy either request.
 - For dashboard p95 validation, prefer query_prometheus with histogram_quantile over query_prometheus_histogram so the exact bucket PromQL can be reused in the panel.
@@ -85,6 +86,19 @@ _PROMQL_RESERVED = {
     "unless",
     "without",
     "offset",
+}
+
+_NUMBER_WORDS = {
+    "one": 1,
+    "two": 2,
+    "three": 3,
+    "four": 4,
+    "five": 5,
+    "six": 6,
+    "seven": 7,
+    "eight": 8,
+    "nine": 9,
+    "ten": 10,
 }
 
 
@@ -211,6 +225,9 @@ class OllamaAgent:
             getattr(settings, "demo_api_timeout_seconds", 10.0),
         )
         self._dashboard_tools_enabled = False
+        self._dashboard_tools_unlocked_at: int | None = None
+        self._request_inference_turns = 0
+        self._last_new_validation_turn: int | None = None
         self.inference_turns = 0
         self.mcp_calls = 0
         # These are deliberately request-scoped. Interactive history remains
@@ -224,6 +241,10 @@ class OllamaAgent:
         self._tool_call_counts: dict[str, int] = {}
         self._prewrite_recovery_blocks = 0
         self._dashboard_write_seen = False
+        self._dashboard_tools_enabled = False
+        self._dashboard_tools_unlocked_at = None
+        self._request_inference_turns = 0
+        self._last_new_validation_turn = None
         self._prewrite_guard_enabled = False
         self._required_dashboard_validations = 1
         self._empty_output_retries = 0
@@ -232,6 +253,11 @@ class OllamaAgent:
         self._saved_dashboard_semantic_errors: list[dict[str, str]] = []
         self._post_write_verified_expressions: set[str] = set()
         self._current_dashboard_panels: list[dict[str, Any]] = []
+        self._dashboard_structure_errors: list[dict[str, Any]] = []
+        self._retrieved_dashboard_uid = ""
+        self._actual_panel_count = 0
+        self._expected_panel_count = 0
+        self._expected_panel_titles: set[str] = set()
         self._post_write_completion_prompts = 0
         self._discovered_metric_names: set[str] = set()
         self._metric_catalog_refresh_done = False
@@ -275,7 +301,7 @@ class OllamaAgent:
         lowered = prompt.lower()
         if any(phrase in lowered for phrase in ("do not need label", "don't need label", "without label", "no label enumeration")):
             return False
-        return "label" in lowered or "tag" in lowered
+        return bool(re.search(r"\b(?:labels?|tags?)\b", lowered))
 
     @staticmethod
     def _prompt_expects_dashboard_write(prompt: str) -> bool:
@@ -297,6 +323,27 @@ class OllamaAgent:
             word in lowered for word in ("existing", "patch", "correct", "repair")
         )
 
+    @staticmethod
+    def _expected_panels_from_prompt(prompt: str) -> tuple[int, set[str]]:
+        count = 0
+        match = re.search(
+            r"\b(one|two|three|four|five|six|seven|eight|nine|ten|\d+)\s+(?:visible\s+)?panels\b",
+            prompt,
+            re.IGNORECASE,
+        )
+        if match:
+            token = match.group(1).lower()
+            count = _NUMBER_WORDS.get(token, int(token) if token.isdigit() else 0)
+        titles: set[str] = set()
+        for line in prompt.splitlines():
+            bullet = re.match(r"^\s*[-*]\s+(.+?)\s*$", line)
+            if not bullet:
+                continue
+            title = bullet.group(1).strip().strip("`*_ ")
+            if title and len(title) <= 80 and not title.endswith(('.', ':')):
+                titles.add(title)
+        return max(count, len(titles)), titles
+
     async def run(self, user_prompt: str) -> str:
         if not self.tools:
             await self.prepare()
@@ -310,9 +357,13 @@ class OllamaAgent:
         self._prewrite_recovery_blocks = 0
         self._dashboard_write_seen = False
         self._prewrite_guard_enabled = self._prompt_expects_dashboard_write(user_prompt)
+        self._expected_panel_count, self._expected_panel_titles = (
+            self._expected_panels_from_prompt(user_prompt)
+        )
         self._required_dashboard_validations = (
-            2
-            if self._prewrite_guard_enabled and self._prompt_is_dashboard_repair(user_prompt)
+            max(2, self._expected_panel_count)
+            if self._prewrite_guard_enabled
+            and self._prompt_is_dashboard_repair(user_prompt)
             else 5 if self._prewrite_guard_enabled else 1
         )
         self._empty_output_retries = 0
@@ -321,6 +372,9 @@ class OllamaAgent:
         self._saved_dashboard_semantic_errors = []
         self._post_write_verified_expressions = set()
         self._current_dashboard_panels = []
+        self._dashboard_structure_errors = []
+        self._retrieved_dashboard_uid = ""
+        self._actual_panel_count = 0
         self._post_write_completion_prompts = 0
         self._discovered_metric_names = set()
         self._metric_catalog_refresh_done = False
@@ -330,10 +384,23 @@ class OllamaAgent:
             self._set_request_tool_phase(user_prompt)
         self.messages.append({"role": "user", "content": user_prompt})
         for turn in range(1, self.settings.max_tool_turns + 1):
+            prewrite_turn_limit = int(getattr(self.settings, "max_prewrite_turns", 8))
+            if self._dashboard_tools_unlocked_at is not None:
+                # The validation that unlocks update_dashboard consumes a
+                # model turn. Allow exactly the following turn to use it.
+                prewrite_turn_limit = max(
+                    prewrite_turn_limit, self._dashboard_tools_unlocked_at + 1
+                )
+            if self._last_new_validation_turn is not None:
+                # Continue while the model is making concrete query-validation
+                # progress, but stop within two turns if that progress stalls.
+                prewrite_turn_limit = max(
+                    prewrite_turn_limit, self._last_new_validation_turn + 2
+                )
             if (
                 self._prewrite_guard_enabled
                 and not self._dashboard_write_seen
-                and turn > int(getattr(self.settings, "max_prewrite_turns", 8))
+                and turn > prewrite_turn_limit
             ):
                 raise OllamaError(
                     "Agent is stuck before dashboard creation; no update_dashboard call was made "
@@ -355,6 +422,7 @@ class OllamaAgent:
                 }
             )
             self.inference_turns += 1
+            self._request_inference_turns += 1
             self._log_inference_stats(response)
             message = response.get("message")
             if not isinstance(message, dict):
@@ -643,12 +711,17 @@ class OllamaAgent:
                         self.progress(f"[grounding] PromQL returned no data: {expression}")
                     else:
                         self._record_success(fingerprint, name)
+                        is_new_validation = expression not in self._validated_promql
                         self._validated_promql[expression] = {
                             "expression": expression,
                             "datasource_uid": arguments.get("datasourceUid"),
                             "returned_data": True,
                             "sample_count": sample_count,
                         }
+                        if is_new_validation:
+                            self._last_new_validation_turn = (
+                                self._request_inference_turns
+                            )
                         self._successful_call_results[fingerprint] = result_text
                         if (
                             self._dashboard_write_seen
@@ -673,14 +746,25 @@ class OllamaAgent:
                             and len(self._validated_promql) >= self._required_dashboard_validations
                         ):
                             self._dashboard_tools_enabled = True
+                            self._dashboard_tools_unlocked_at = (
+                                self._request_inference_turns
+                            )
                             if self._all_mcp_tools:
                                 self._set_request_tool_phase(self._current_user_prompt)
                 else:
                     self._record_success(fingerprint, name)
                     if name == "get_dashboard_by_uid":
                         result_text = self._record_dashboard_retrieval(result_text)
+                        if (
+                            self._dashboard_write_seen
+                            and self._dashboard_retrieved_after_write
+                            and not self._dashboard_structure_errors
+                        ):
+                            result_text = await self._verify_saved_dashboard_queries(
+                                result_text
+                            )
                     if name == "update_dashboard":
-                        self._record_dashboard_write()
+                        self._record_dashboard_write(arguments)
                     self._successful_call_results[fingerprint] = result_text
                     self.progress(f"[mcp] tool succeeded: {name}")
             return result_text
@@ -701,6 +785,19 @@ class OllamaAgent:
             return {
                 "error": "DASHBOARD_WRITE_NOT_VERIFIED",
                 "instruction": "Retrieve the written dashboard with get_dashboard_by_uid before finishing.",
+            }
+        if self._dashboard_structure_errors:
+            return {
+                "error": "DASHBOARD_STRUCTURE_NOT_RENDERABLE",
+                "dashboard_uid": self._retrieved_dashboard_uid,
+                "panel_count": self._actual_panel_count,
+                "expected_panel_count": self._expected_panel_count,
+                "expected_panel_titles": sorted(self._expected_panel_titles),
+                "problems": self._dashboard_structure_errors,
+                "instruction": (
+                    "Create complete panel objects in the actual dashboard's top-level panels array, "
+                    "write the correction, and retrieve it again before finishing."
+                ),
             }
         if self._saved_dashboard_semantic_errors:
             return {
@@ -728,12 +825,34 @@ class OllamaAgent:
         """Compatibility helper retained for focused tests and callers."""
         return self._dashboard_completion_error() is not None
 
-    def _record_dashboard_write(self) -> None:
+    def _record_dashboard_write(self, arguments: dict[str, Any] | None = None) -> None:
+        proposed_panels = self._proposed_dashboard_panels(arguments or {})
+        if proposed_panels is not None:
+            if not self._expected_panel_count:
+                self._expected_panel_count = len(proposed_panels)
+            if not self._expected_panel_titles:
+                self._expected_panel_titles = {
+                    str(panel.get("title") or "").strip()
+                    for panel in proposed_panels
+                    if str(panel.get("title") or "").strip()
+                }
+        elif self._current_dashboard_panels:
+            if not self._expected_panel_count:
+                self._expected_panel_count = len(self._current_dashboard_panels)
+            if not self._expected_panel_titles:
+                self._expected_panel_titles = {
+                    str(panel.get("title") or "").strip()
+                    for panel in self._current_dashboard_panels
+                    if str(panel.get("title") or "").strip()
+                }
         self._dashboard_write_seen = True
         self._dashboard_retrieved_after_write = False
         self._saved_dashboard_expressions = set()
         self._saved_dashboard_semantic_errors = []
         self._post_write_verified_expressions = set()
+        self._dashboard_structure_errors = []
+        self._retrieved_dashboard_uid = ""
+        self._actual_panel_count = 0
         # Exact query calls must run again after the saved dashboard is read;
         # a pre-write cached result is not post-write verification.
         self._successful_call_results = {
@@ -930,51 +1049,35 @@ class OllamaAgent:
 
     @staticmethod
     def _extract_dashboard_panels(payload: Any) -> list[dict[str, Any]]:
-        if isinstance(payload, dict):
-            panels = payload.get("panels")
-            if isinstance(panels, list) and all(isinstance(panel, dict) for panel in panels):
+        if isinstance(payload, dict) and isinstance(payload.get("panels"), list):
+            panels = payload["panels"]
+            if all(isinstance(panel, dict) for panel in panels):
                 return panels
-            for child in payload.values():
-                found = OllamaAgent._extract_dashboard_panels(child)
-                if found:
-                    return found
-        elif isinstance(payload, list):
-            for child in payload:
-                found = OllamaAgent._extract_dashboard_panels(child)
-                if found:
-                    return found
         return []
 
     @staticmethod
     def _dashboard_document(payload: Any) -> dict[str, Any] | None:
-        """Return the dashboard document from mcp-grafana's response wrapper."""
+        """Unwrap MCP or Grafana API envelopes exactly once."""
         if isinstance(payload, dict):
             content = payload.get("content")
             if isinstance(content, list):
                 for item in content:
                     if isinstance(item, dict) and isinstance(item.get("dashboard"), dict):
                         return item["dashboard"]
-            if isinstance(payload.get("dashboard"), dict):
+            if "meta" in payload and isinstance(payload.get("dashboard"), dict):
                 return payload["dashboard"]
+            if any(key in payload for key in ("uid", "title", "panels")):
+                return payload
         return None
 
     @staticmethod
     def _find_panels_with_path(
         value: Any, path: str = "$"
     ) -> tuple[list[dict[str, Any]], str]:
-        if isinstance(value, dict):
-            panels = value.get("panels")
-            if isinstance(panels, list) and all(
-                isinstance(panel, dict) for panel in panels
-            ):
-                return panels, f"{path}.panels"
-            for key, child in value.items():
-                if isinstance(child, dict):
-                    found, found_path = OllamaAgent._find_panels_with_path(
-                        child, f"{path}.{key}"
-                    )
-                    if found:
-                        return found, found_path
+        """Return only the actual dashboard's direct classic panels array."""
+        panels = OllamaAgent._extract_dashboard_panels(value)
+        if panels:
+            return panels, f"{path}.panels"
         return [], "$.panels"
 
     @classmethod
@@ -987,16 +1090,180 @@ class OllamaAgent:
                     contexts.append({"panel": title, "expression": target["expr"]})
         return contexts
 
+    @staticmethod
+    def _datasource_uid(value: Any) -> str:
+        if isinstance(value, str):
+            return value.strip()
+        if isinstance(value, dict):
+            return str(value.get("uid") or value.get("type") or "").strip()
+        return ""
+
+    @staticmethod
+    def _panel_unit(panel: dict[str, Any]) -> str:
+        field_config = panel.get("fieldConfig")
+        if isinstance(field_config, dict):
+            defaults = field_config.get("defaults")
+            if isinstance(defaults, dict) and defaults.get("unit"):
+                return str(defaults["unit"])
+        yaxes = panel.get("yaxes")
+        if isinstance(yaxes, list) and yaxes and isinstance(yaxes[0], dict):
+            return str(yaxes[0].get("format") or "")
+        return ""
+
+    @staticmethod
+    def _unit_matches_title(title: str, unit: str) -> bool:
+        lowered_title = title.lower()
+        lowered_unit = unit.lower()
+        if "request" in lowered_title and "rate" in lowered_title:
+            return lowered_unit in {"reqps", "ops", "cps"}
+        if "error" in lowered_title and any(
+            marker in lowered_title for marker in ("percent", "percentage", "%")
+        ):
+            return lowered_unit in {"percent", "percentunit"}
+        if "cpu" in lowered_title:
+            return lowered_unit in {"percent", "percentunit"}
+        if "latency" in lowered_title or "duration" in lowered_title:
+            return lowered_unit in {"s", "seconds"}
+        if "memory" in lowered_title:
+            return "bytes" in lowered_unit
+        return True
+
+    def _panel_structure_problems(
+        self,
+        panels: list[dict[str, Any]],
+        *,
+        expected_count: int | None = None,
+        expected_titles: set[str] | None = None,
+    ) -> list[dict[str, Any]]:
+        problems: list[dict[str, Any]] = []
+        required_count = max(
+            1, self._expected_panel_count if expected_count is None else expected_count
+        )
+        required_titles = self._expected_panel_titles if expected_titles is None else expected_titles
+        if len(panels) < required_count:
+            problems.append(
+                {
+                    "problem": "panel_count_below_expected",
+                    "panel_count": len(panels),
+                    "expected_panel_count": required_count,
+                }
+            )
+        titles = {
+            str(panel.get("title") or "").strip()
+            for panel in panels
+            if str(panel.get("title") or "").strip()
+        }
+        missing_titles = sorted(required_titles - titles)
+        if missing_titles:
+            problems.append(
+                {"problem": "missing_expected_panel_titles", "titles": missing_titles}
+            )
+
+        ids: list[int] = []
+        for index, panel in enumerate(panels):
+            title = str(panel.get("title") or "").strip()
+            label = title or f"panel[{index}]"
+            panel_id = panel.get("id")
+            if not isinstance(panel_id, int) or isinstance(panel_id, bool):
+                problems.append({"panel": label, "problem": "missing_numeric_id"})
+            else:
+                ids.append(panel_id)
+            if not title:
+                problems.append({"panel": label, "problem": "missing_title"})
+            panel_type = panel.get("type")
+            if not isinstance(panel_type, str) or not panel_type.strip():
+                problems.append({"panel": label, "problem": "missing_visualization_type"})
+            grid = panel.get("gridPos")
+            valid_grid = isinstance(grid, dict) and all(
+                isinstance(grid.get(key), int) and not isinstance(grid.get(key), bool)
+                for key in ("x", "y", "w", "h")
+            )
+            if valid_grid:
+                valid_grid = (
+                    grid["x"] >= 0
+                    and grid["y"] >= 0
+                    and grid["w"] > 0
+                    and grid["h"] > 0
+                )
+            if not valid_grid:
+                problems.append({"panel": label, "problem": "invalid_gridPos"})
+
+            targets = panel.get("targets")
+            if not isinstance(targets, list) or not targets:
+                problems.append({"panel": label, "problem": "missing_targets"})
+                targets = []
+            expressions: list[str] = []
+            datasource_uids = {self._datasource_uid(panel.get("datasource"))}
+            for target in targets:
+                if not isinstance(target, dict):
+                    continue
+                expression = target.get("expr")
+                if isinstance(expression, str) and expression.strip():
+                    expressions.append(expression)
+                datasource_uids.add(self._datasource_uid(target.get("datasource")))
+            datasource_uids.discard("")
+            if not expressions:
+                problems.append({"panel": label, "problem": "missing_promql"})
+            if not datasource_uids:
+                problems.append({"panel": label, "problem": "missing_datasource"})
+            expected_datasources = {
+                str(self._validated_promql[expression].get("datasource_uid") or "")
+                for expression in expressions
+                if expression in self._validated_promql
+            }
+            expected_datasources.discard("")
+            if expected_datasources and datasource_uids.isdisjoint(expected_datasources):
+                problems.append(
+                    {
+                        "panel": label,
+                        "problem": "incorrect_datasource",
+                        "expected": sorted(expected_datasources),
+                        "actual": sorted(datasource_uids),
+                    }
+                )
+            unit = self._panel_unit(panel)
+            if not unit or not self._unit_matches_title(title, unit):
+                problems.append(
+                    {"panel": label, "problem": "missing_or_inappropriate_unit", "unit": unit}
+                )
+        duplicate_ids = sorted({panel_id for panel_id in ids if ids.count(panel_id) > 1})
+        if duplicate_ids:
+            problems.append({"problem": "duplicate_panel_ids", "ids": duplicate_ids})
+        return problems
+
+    @staticmethod
+    def _proposed_dashboard_panels(
+        arguments: dict[str, Any]
+    ) -> list[dict[str, Any]] | None:
+        dashboard = arguments.get("dashboard")
+        if isinstance(dashboard, dict) and isinstance(dashboard.get("panels"), list):
+            panels = dashboard["panels"]
+            return panels if all(isinstance(panel, dict) for panel in panels) else []
+        for operation in arguments.get("operations", []) or []:
+            if not isinstance(operation, dict):
+                continue
+            if str(operation.get("path", "")).rstrip() == "$.panels" and isinstance(
+                operation.get("value"), list
+            ):
+                panels = operation["value"]
+                return panels if all(isinstance(panel, dict) for panel in panels) else []
+        return None
+
     def _record_dashboard_retrieval(self, result_text: str) -> str:
         try:
             payload = json.loads(result_text)
         except json.JSONDecodeError:
             return result_text
         document = self._dashboard_document(payload)
-        panels, panel_path = self._find_panels_with_path(document or payload)
-        if not panels:
-            return result_text
+        panels = self._extract_dashboard_panels(document or {})
         self._current_dashboard_panels = panels
+        self._actual_panel_count = len(panels)
+        self._retrieved_dashboard_uid = str((document or {}).get("uid") or "")
+        structure_errors = self._panel_structure_problems(panels)
+        if document is None:
+            structure_errors.insert(0, {"problem": "dashboard_document_missing"})
+        elif not isinstance(document.get("panels"), list):
+            structure_errors.insert(0, {"problem": "top_level_panels_array_missing"})
         contexts = self._panel_query_contexts(panels)
         for panel_index, panel in enumerate(panels):
             title = str(panel.get("title") or "Untitled panel")
@@ -1006,7 +1273,7 @@ class OllamaAgent:
                 for context in contexts:
                     if context["panel"] == title and context["expression"] == target["expr"] and "patch_path" not in context:
                         context["patch_path"] = (
-                            f"{panel_path}[{panel_index}].targets[{target_index}].expr"
+                            f"$.panels[{panel_index}].targets[{target_index}].expr"
                         )
                         break
         semantic_errors = [
@@ -1020,6 +1287,7 @@ class OllamaAgent:
                 context["expression"] for context in contexts
             }
             self._saved_dashboard_semantic_errors = semantic_errors
+            self._dashboard_structure_errors = structure_errors
             self._post_write_verified_expressions = set()
             # Force every saved expression to reach Prometheus after this
             # retrieval, even if it was validated before the write.
@@ -1029,16 +1297,96 @@ class OllamaAgent:
                 if not fingerprint.startswith(("query_prometheus:", "query_prometheus_histogram:"))
             }
         payload["dashboard_verification"] = {
-            "status": "semantic_errors" if semantic_errors else "retrieved",
+            "status": (
+                "structure_not_renderable"
+                if structure_errors
+                else "semantic_errors" if semantic_errors else "retrieved"
+            ),
+            "error": "DASHBOARD_STRUCTURE_NOT_RENDERABLE" if structure_errors else None,
+            "dashboard_uid": self._retrieved_dashboard_uid,
+            "panel_count": len(panels),
+            "expected_panel_count": self._expected_panel_count,
+            "expected_panel_titles": sorted(self._expected_panel_titles),
             "saved_panel_queries": contexts,
+            "structure_errors": structure_errors,
             "semantic_errors": semantic_errors,
             "instruction": (
-                "Correct the listed semantic errors with validated PromQL before updating."
+                "Create complete panel objects at $.panels with update_dashboard patch mode. "
+                "The response's dashboard key is an envelope, not part of the patch path; never use $.dashboard.panels."
+                if structure_errors
+                else "Correct the listed semantic errors with validated PromQL before updating."
                 if semantic_errors
                 else "After a write, run every saved expression with query_prometheus and require real data before finishing."
             ),
         }
         return json.dumps(payload, ensure_ascii=False)
+
+    async def _verify_saved_dashboard_queries(self, result_text: str) -> str:
+        """Independently re-run every saved panel expression after retrieval."""
+        results: list[dict[str, Any]] = []
+        for expression in sorted(self._saved_dashboard_expressions):
+            validation = self._validated_promql.get(expression)
+            datasource_uid = str((validation or {}).get("datasource_uid") or "")
+            if not validation or not datasource_uid:
+                results.append(
+                    {
+                        "expression": expression,
+                        "returned_data": False,
+                        "error": "expression_was_not_validated_before_write",
+                    }
+                )
+                continue
+            try:
+                self.mcp_calls += 1
+                result = await self.mcp.call_tool(
+                    "query_prometheus",
+                    {
+                        "datasourceUid": datasource_uid,
+                        "expr": expression,
+                        "queryType": "instant",
+                        "endTime": "now",
+                    },
+                )
+                serialized = serialize_mcp_result(
+                    result, self.settings.max_tool_result_chars
+                )
+                payload = json.loads(serialized)
+                returned_data, sample_count = _result_has_data(payload)
+                if not getattr(result, "is_error", False) and returned_data:
+                    self._post_write_verified_expressions.add(expression)
+                results.append(
+                    {
+                        "expression": expression,
+                        "returned_data": bool(
+                            not getattr(result, "is_error", False) and returned_data
+                        ),
+                        "sample_count": sample_count,
+                        "error": "mcp_error" if getattr(result, "is_error", False) else None,
+                    }
+                )
+            except Exception as exc:
+                results.append(
+                    {
+                        "expression": expression,
+                        "returned_data": False,
+                        "error": str(exc)[:500],
+                    }
+                )
+        try:
+            response_payload = json.loads(result_text)
+        except json.JSONDecodeError:
+            return result_text
+        verification = response_payload.setdefault("dashboard_verification", {})
+        verification["saved_query_results"] = results
+        verification["all_saved_queries_returned_data"] = bool(results) and all(
+            result.get("returned_data") for result in results
+        )
+        verification["instruction"] = (
+            "All actual saved panel queries were independently re-run after retrieval and returned data; final success is allowed."
+            if verification["all_saved_queries_returned_data"]
+            else "Some actual saved panel queries were unvalidated, failed, or returned no data. Correct them before finishing."
+        )
+        return json.dumps(response_payload, ensure_ascii=False)
 
     def _dashboard_expression_contexts(
         self, arguments: dict[str, Any]
@@ -1066,6 +1414,12 @@ class OllamaAgent:
                 contexts.append({"panel": panel_title, "expression": value})
             elif isinstance(value, dict) and "targets" in value:
                 contexts.extend(self._panel_query_contexts([value]))
+            elif isinstance(value, list):
+                contexts.extend(
+                    self._panel_query_contexts(
+                        [panel for panel in value if isinstance(panel, dict)]
+                    )
+                )
         return contexts
 
     @staticmethod
@@ -1097,6 +1451,52 @@ class OllamaAgent:
         return list(dict.fromkeys(expressions))
 
     def _dashboard_promql_gate(self, arguments: dict[str, Any]) -> dict[str, Any] | None:
+        for operation in arguments.get("operations", []) or []:
+            if not isinstance(operation, dict):
+                continue
+            path = str(operation.get("path", ""))
+            if "panels" in path and not (
+                path == "$.panels"
+                or path.startswith("$.panels[")
+                or path.startswith("$.panels/")
+            ):
+                return {
+                    "error": "INVALID_DASHBOARD_PATCH_PATH",
+                    "path": path,
+                    "instruction": (
+                        "update_dashboard paths are relative to the actual Grafana dashboard document. "
+                        "Use $.panels, never a path derived from an MCP response envelope such as $.dashboard.panels."
+                    ),
+                }
+        dashboard = arguments.get("dashboard")
+        if (
+            isinstance(dashboard, dict)
+            and "panels" not in dashboard
+            and self._extract_dashboard_panels(dashboard.get("dashboard"))
+        ):
+            return {
+                "error": "DASHBOARD_STRUCTURE_NOT_RENDERABLE",
+                "panel_count": 0,
+                "expected_panel_count": self._expected_panel_count,
+                "instruction": (
+                    "The dashboard argument contains another dashboard wrapper. "
+                    "Put complete panel objects directly in dashboard.panels."
+                ),
+            }
+        proposed_panels = self._proposed_dashboard_panels(arguments)
+        if proposed_panels is not None:
+            structure_errors = self._panel_structure_problems(proposed_panels)
+            if structure_errors:
+                return {
+                    "error": "DASHBOARD_STRUCTURE_NOT_RENDERABLE",
+                    "panel_count": len(proposed_panels),
+                    "expected_panel_count": self._expected_panel_count,
+                    "problems": structure_errors,
+                    "instruction": (
+                        "Create complete Grafana panel objects with unique ids, titles, types, positive gridPos, "
+                        "Prometheus datasource, targets, PromQL, and appropriate units."
+                    ),
+                }
         expressions = self._dashboard_expressions(arguments)
         if not expressions:
             return None
