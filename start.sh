@@ -40,7 +40,11 @@ fi
 export AI_DASHBOARD_MODEL="$DASHBOARD_MODEL"
 
 echo "[start] Starting Grafana, Prometheus, demo exporter, MCP, and building the AI app plugin..."
-docker compose up -d --build
+if ! docker compose up -d --build; then
+  echo "[start] Docker Compose startup failed. Relevant logs:" >&2
+  docker compose logs --no-color --tail=160 ai-plugin-build grafana >&2 || true
+  die "Local stack/plugin build failed."
+fi
 
 container_health() {
   local service="$1" id status
@@ -55,7 +59,8 @@ deadline=$((SECONDS + 180))
 until container_health grafana && container_health prometheus && container_health demo && container_health mcp-grafana && ollama_ready; do
   (( SECONDS < deadline )) || {
     docker compose ps >&2 || true
-    die "Timed out waiting for the local stack. If ai-plugin-build failed, run: docker compose logs ai-plugin-build"
+    docker compose logs --no-color --tail=120 ai-plugin-build grafana >&2 || true
+    die "Timed out waiting for the local stack."
   }
   sleep 2
 done
@@ -106,7 +111,7 @@ proxy_deadline=$((SECONDS + 30))
 until proxy_ready; do
   (( SECONDS < proxy_deadline )) || {
     echo "[start] Grafana is up, but the AI app proxy is not reachable yet." >&2
-    echo "[start] Check: docker compose logs grafana ai-plugin-build" >&2
+    docker compose logs --no-color --tail=120 grafana ai-plugin-build >&2 || true
     die "AI Dashboard Builder plugin/proxy verification failed."
   }
   sleep 1
