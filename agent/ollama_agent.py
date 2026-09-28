@@ -8,6 +8,11 @@ from collections.abc import Awaitable, Callable
 from typing import Any
 
 from .config import Settings
+from .demo_client import (
+    LOCAL_DEMO_TOOL_NAMES,
+    DemoScenarioClient,
+    local_demo_tools,
+)
 from .mcp_client import (
     ALLOWED_TOOL_NAMES,
     DISCOVERY_TOOL_NAMES,
@@ -30,6 +35,9 @@ Rules:
 - If a tool errors, inspect the error and retry with corrected arguments.
 - For simple PromQL validation, prefer an instant query with endTime "now". Never repeat an unchanged failed tool call.
 - Never claim success without verification. Keep tool calls focused and avoid unnecessary tools.
+- Prometheus data is observed time-series data; do not try to edit its database. If the user asks to change the simulated workload, use only the dedicated local demo scenario tools (never shell, curl, arbitrary HTTP, or files).
+- After changing a demo scenario, allow Prometheus at least one scrape interval to observe new samples, then query Prometheus and verify the requested change before describing it as fact.
+- Demo scenario tools control the exporter source workload; dashboard discovery, validation, creation, and updates remain Grafana MCP operations.
 
 For update_dashboard, use the live schema. It supports a full dashboard JSON for creation or uid plus operations for targeted updates. Use the discovered Prometheus datasource UID in panel targets.
 """
@@ -58,7 +66,13 @@ class OllamaAgent:
         self.messages: list[dict[str, Any]] = [{"role": "system", "content": SYSTEM_PROMPT}]
         self.tools: list[dict[str, Any]] = []
         self.mcp_tool_names: set[str] = set()
+        self.local_tool_names: set[str] = set(LOCAL_DEMO_TOOL_NAMES)
+        self.tool_names: set[str] = set()
         self._all_mcp_tools: dict[str, Any] = {}
+        self.demo = DemoScenarioClient(
+            getattr(settings, "demo_api_url", "http://127.0.0.1:8000"),
+            getattr(settings, "demo_api_timeout_seconds", 10.0),
+        )
         self._dashboard_tools_enabled = False
         self.inference_turns = 0
         self.mcp_calls = 0
@@ -73,11 +87,13 @@ class OllamaAgent:
 
     def _set_tool_phase(self, names: set[str] | frozenset[str]) -> None:
         selected = [self._all_mcp_tools[name] for name in names]
-        self.tools = [
+        mcp_tools = [
             mcp_tool_to_ollama_tool(tool)
             for tool in sorted(selected, key=lambda item: item.name)
         ]
-        self.mcp_tool_names = {tool["function"]["name"] for tool in self.tools}
+        self.tools = mcp_tools + local_demo_tools()
+        self.mcp_tool_names = {tool["function"]["name"] for tool in mcp_tools}
+        self.tool_names = self.mcp_tool_names | self.local_tool_names
         phase = "full dashboard" if self._dashboard_tools_enabled else "discovery"
         self.progress(
             f"[agent] exposing {len(self.tools)} {phase} MCP tools: "
@@ -120,27 +136,35 @@ class OllamaAgent:
             for call in tool_calls:
                 name, arguments = self._parse_tool_call(call)
                 self.progress(f"[qwen] requesting tool: {name}")
-                self.mcp_calls += 1
                 try:
-                    result = await self.mcp.call_tool(name, arguments)
-                    result_text = serialize_mcp_result(
-                        result, self.settings.max_tool_result_chars
-                    )
-                    if getattr(result, "is_error", False):
-                        argument_preview = json.dumps(arguments, ensure_ascii=False)[:1000]
-                        error_preview = result_text[:1000]
-                        self.progress(
-                            f"[mcp] tool returned an error: {name} "
-                            f"arguments={argument_preview} result={error_preview}"
-                        )
+                    if name in self.local_tool_names:
+                        result = await self.demo.call_tool(name, arguments)
+                        if name in {"set_demo_scenario", "set_demo_scenario_preset", "reset_demo_scenario"}:
+                            wait_seconds = max(0.0, float(getattr(self.settings, "demo_scrape_wait_seconds", 6.0)))
+                            if wait_seconds:
+                                self.progress(f"[demo] waiting {wait_seconds:.0f}s for Prometheus scrape")
+                                await asyncio.sleep(wait_seconds)
+                        result_text = json.dumps({"is_error": False, "scenario": result}, ensure_ascii=False)
+                        self.progress(f"[demo] tool succeeded: {name}")
                     else:
-                        self.progress(f"[mcp] tool succeeded: {name}")
-                    if name in {"query_prometheus", "query_prometheus_histogram"} and not self._dashboard_tools_enabled:
-                        self._dashboard_tools_enabled = True
-                        self._set_tool_phase(ALLOWED_TOOL_NAMES)
+                        self.mcp_calls += 1
+                        result = await self.mcp.call_tool(name, arguments)
+                        result_text = serialize_mcp_result(result, self.settings.max_tool_result_chars)
+                        if getattr(result, "is_error", False):
+                            argument_preview = json.dumps(arguments, ensure_ascii=False)[:1000]
+                            error_preview = result_text[:1000]
+                            self.progress(
+                                f"[mcp] tool returned an error: {name} "
+                                f"arguments={argument_preview} result={error_preview}"
+                            )
+                        else:
+                            self.progress(f"[mcp] tool succeeded: {name}")
+                        if name in {"query_prometheus", "query_prometheus_histogram"} and not self._dashboard_tools_enabled:
+                            self._dashboard_tools_enabled = True
+                            self._set_tool_phase(ALLOWED_TOOL_NAMES)
                 except Exception as exc:
                     result_text = json.dumps({"error": str(exc)})
-                    self.progress(f"[mcp] tool failed: {name}: {exc}")
+                    self.progress(f"[{('demo' if name in self.local_tool_names else 'mcp')}] tool failed: {name}: {exc}")
                 self.messages.append(
                     {"role": "tool", "tool_name": name, "content": result_text}
                 )
@@ -171,7 +195,8 @@ class OllamaAgent:
         if not isinstance(function, dict):
             raise OllamaError(f"Malformed Ollama tool call function: {call!r}")
         name = function.get("name")
-        if name not in self.mcp_tool_names:
+        allowed_names = getattr(self, "tool_names", None) or self.mcp_tool_names
+        if name not in allowed_names:
             raise PermissionError(f"Ollama requested unknown/non-allowlisted tool: {name}")
         arguments = function.get("arguments", {})
         if isinstance(arguments, str):

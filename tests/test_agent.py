@@ -6,6 +6,12 @@ from agent.mcp_client import (
     mcp_tool_to_ollama_tool,
     select_allowed_tools,
 )
+from agent.demo_client import (
+    LOCAL_DEMO_TOOL_NAMES,
+    LOCAL_DEMO_TOOLS,
+    DemoScenarioClient,
+    validate_local_arguments,
+)
 from agent.ollama_agent import OllamaAgent, OllamaError
 
 
@@ -34,6 +40,13 @@ class AgentPlumbingTests(unittest.TestCase):
         )
         self.assertEqual([tool.name for tool in selected], ["query_prometheus"])
         self.assertIn("update_dashboard", ALLOWED_TOOL_NAMES)
+
+    def test_local_tool_schemas_are_explicitly_allowlisted(self):
+        names = {tool["function"]["name"] for tool in LOCAL_DEMO_TOOLS}
+        self.assertEqual(names, set(LOCAL_DEMO_TOOL_NAMES))
+        validate_local_arguments("set_demo_scenario_preset", {"name": "high-errors"})
+        with self.assertRaises(PermissionError):
+            validate_local_arguments("curl", {})
 
     def test_unknown_tool_call_is_rejected(self):
         agent = OllamaAgent.__new__(OllamaAgent)
@@ -73,6 +86,7 @@ class AgentLoopTests(unittest.IsolatedAsyncioTestCase):
             ollama_context_size=2048,
             ollama_num_predict=64,
             ollama_temperature=0,
+            demo_scrape_wait_seconds=0,
         )
 
     @staticmethod
@@ -131,6 +145,47 @@ class AgentLoopTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaisesRegex(OllamaError, "Maximum tool-turn limit"):
             await agent.run("loop forever")
         self.assertEqual(len(mcp.calls), 2)
+
+    async def test_local_tool_is_dispatched_without_mcp(self):
+        responses = iter([
+            self._tool_call(name="set_demo_scenario_preset", arguments={"name": "high-errors"}),
+            {"message": {"role": "assistant", "content": "changed"}},
+        ])
+
+        async def request(_payload):
+            return next(responses)
+
+        class FakeDemo:
+            def __init__(self):
+                self.calls = []
+
+            async def call_tool(self, name, arguments):
+                self.calls.append((name, arguments))
+                return {"preset": "high-errors"}
+
+        mcp = FakeMCP()
+        agent = OllamaAgent(self._settings(), mcp, ollama_request=request, progress=lambda _: None)
+        agent.demo = FakeDemo()
+        agent.tools = list(LOCAL_DEMO_TOOLS)
+        agent.mcp_tool_names = set()
+        agent.tool_names = set(LOCAL_DEMO_TOOL_NAMES)
+        result = await agent.run("make errors high")
+        self.assertEqual(result, "changed")
+        self.assertEqual(agent.demo.calls, [("set_demo_scenario_preset", {"name": "high-errors"})])
+        self.assertEqual(mcp.calls, [])
+
+    async def test_demo_client_dispatches_to_specific_api_endpoint(self):
+        client = DemoScenarioClient("http://demo.invalid")
+        requests = []
+
+        def fake_request(method, path, body):
+            requests.append((method, path, body))
+            return {"preset": "high-errors"}
+
+        client._request = fake_request
+        result = await client.call_tool("set_demo_scenario_preset", {"name": "high-errors"})
+        self.assertEqual(result["preset"], "high-errors")
+        self.assertEqual(requests, [("POST", "/scenario/preset", {"name": "high-errors"})])
 
 
 if __name__ == "__main__":

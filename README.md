@@ -2,6 +2,8 @@
 
 This repository contains a local monitoring playground, the official Grafana MCP server, and a small host-side Python agent that lets a local Ollama model operate Grafana through structured MCP tool calls. It does not use Grafana Assistant or a hosted LLM.
 
+For the shortest practical walkthrough, see [DEMO.md](DEMO.md). Start the complete demo with `./start.sh`.
+
 ```text
 User ── Python agent ── Ollama: http://127.0.0.1:11434
                          │ native structured tool calls

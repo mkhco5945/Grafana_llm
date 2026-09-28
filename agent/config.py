@@ -18,6 +18,7 @@ class Settings:
     ollama_url: str
     ollama_model: str
     mcp_grafana_url: str
+    demo_api_url: str
     mcp_server_token: str
     ollama_timeout_seconds: float
     mcp_timeout_seconds: float
@@ -28,6 +29,8 @@ class Settings:
     ollama_thinking: bool
     max_tool_turns: int
     max_tool_result_chars: int
+    demo_api_timeout_seconds: float
+    demo_scrape_wait_seconds: float
 
     @classmethod
     def from_env(cls, env_file: str | None = None) -> "Settings":
@@ -43,6 +46,7 @@ class Settings:
             mcp_grafana_url=os.getenv(
                 "MCP_GRAFANA_URL", "http://127.0.0.1:8002/mcp"
             ),
+            demo_api_url=os.getenv("DEMO_API_URL", "http://127.0.0.1:8000").rstrip("/"),
             mcp_server_token=token,
             ollama_timeout_seconds=float(os.getenv("OLLAMA_TIMEOUT_SECONDS", "900")),
             mcp_timeout_seconds=float(os.getenv("MCP_TIMEOUT_SECONDS", "120")),
@@ -55,4 +59,6 @@ class Settings:
             max_tool_result_chars=int(
                 os.getenv("AGENT_MAX_TOOL_RESULT_CHARS", "60000")
             ),
+            demo_api_timeout_seconds=float(os.getenv("DEMO_API_TIMEOUT_SECONDS", "10")),
+            demo_scrape_wait_seconds=float(os.getenv("DEMO_SCRAPE_WAIT_SECONDS", "6")),
         )
