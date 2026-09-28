@@ -31,6 +31,33 @@ services:
       retries: 20
     restart: unless-stopped
 
+  ai-plugin-build:
+    image: node:22-alpine
+    working_dir: /work
+    environment:
+      HTTP_PROXY: ${HTTP_PROXY:-}
+      HTTPS_PROXY: ${HTTPS_PROXY:-}
+      NO_PROXY: ${NO_PROXY:-localhost,127.0.0.1}
+      http_proxy: ${http_proxy:-}
+      https_proxy: ${https_proxy:-}
+      no_proxy: ${no_proxy:-localhost,127.0.0.1}
+    volumes:
+      - ./grafana-ai-plugin:/src:ro
+      - ai-plugin-dist:/dist
+    tmpfs:
+      - /work
+    command:
+      - /bin/sh
+      - -ec
+      - |
+        cp -R /src/. /work/
+        npm install --no-audit --no-fund
+        npm run typecheck
+        npm run build
+        rm -rf /dist/*
+        cp -R dist/. /dist/
+        echo "AI Dashboard Builder plugin built successfully"
+
   grafana:
     image: grafana/grafana:12.1.1
     depends_on:
@@ -38,13 +65,19 @@ services:
         condition: service_healthy
       demo:
         condition: service_healthy
+      ai-plugin-build:
+        condition: service_completed_successfully
     environment:
       GF_SECURITY_ADMIN_USER: admin
       GF_SECURITY_ADMIN_PASSWORD: admin
       GF_USERS_ALLOW_SIGN_UP: "false"
+      GF_PLUGINS_ALLOW_LOADING_UNSIGNED_PLUGINS: mkhco-ai-dashboard-app
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     volumes:
       - grafana-data:/var/lib/grafana
       - ./grafana/provisioning:/etc/grafana/provisioning:ro
+      - ai-plugin-dist:/var/lib/grafana/plugins/mkhco-ai-dashboard-app:ro
     ports:
       - "3000:3000"
     healthcheck:
@@ -85,3 +118,4 @@ services:
 volumes:
   grafana-data:
   prometheus-data:
+  ai-plugin-dist:
