@@ -24,7 +24,7 @@ export type JobResponse = {
   dashboard_url: string;
 };
 
-async function request<T>(options: { url: string; method?: string; data?: unknown }): Promise<T> {
+async function request<T>(options: { url: string; method?: 'GET' | 'POST'; data?: unknown }): Promise<T> {
   const response = await lastValueFrom(
     getBackendSrv().fetch<T>({
       url: options.url,
