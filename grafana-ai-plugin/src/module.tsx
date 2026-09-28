@@ -13,13 +13,13 @@ export const plugin = new AppPlugin<{}>()
     targets: [PluginExtensionPoints.CommandPalette],
     title: 'Create dashboard with AI',
     description: 'Open the local Ollama + Grafana MCP dashboard builder',
-    icon: 'robot',
+    icon: 'ai',
     path: appPath,
   })
   .addLink({
     targets: [PluginExtensionPoints.DashboardPanelMenu],
     title: 'Open AI dashboard builder',
     description: 'Ask the local AI to inspect or modify this Grafana environment',
-    icon: 'robot',
+    icon: 'ai',
     path: appPath,
   });
