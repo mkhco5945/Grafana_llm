@@ -1,0 +1,7 @@
+apiVersion: 1
+
+apps:
+  - type: mkhco-ai-dashboard-app
+    org_id: 1
+    disabled: false
+    jsonData: {}
