@@ -118,7 +118,7 @@ The required caller token and configurable runtime values live in `.env`. See [.
 | `AGENT_MAX_TOOL_TURNS` | `20` |
 | `AGENT_MAX_SAME_TOOL_FAILURES` | `2` |
 | `AGENT_MAX_PREWRITE_RECOVERY_BLOCKS` | `3` |
-| `AGENT_MAX_PREWRITE_TURNS` | `8` for dashboard requests |
+| `AGENT_MAX_PREWRITE_TURNS` | `12` for dashboard requests |
 
 The agent discovers all 81 MCP tools but starts by exposing a lean read-only datasource, Prometheus, and dashboard-inspection set. Label tools are added for label-focused prompts. After it validates a PromQL query, it unlocks the mutating `update_dashboard` tool, completing this explicit allowlist:
 
@@ -129,6 +129,8 @@ The agent discovers all 81 MCP tools but starts by exposing a lean read-only dat
 - `update_dashboard`
 
 Each model response may request one or more tools. The agent validates every tool name and argument object, sends valid calls to MCP, appends the MCP result as an Ollama tool message, and repeats until Qwen returns a final answer or reaches the configured turn limit. Progress logs omit both bearer tokens.
+
+Prometheus metric discovery is request-scoped and authoritative: queries using undiscovered metric names or returning no data cannot unlock a dashboard write. Dashboard rate, percentage, and histogram-percentile panels receive narrow semantic checks, and after every successful write the agent requires a fresh dashboard retrieval plus non-empty validation of every saved PromQL expression before accepting a final success answer.
 
 Run the focused plumbing tests with:
 

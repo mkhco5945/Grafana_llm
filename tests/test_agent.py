@@ -13,7 +13,7 @@ from agent.demo_client import (
     DemoScenarioClient,
     validate_local_arguments,
 )
-from agent.ollama_agent import OllamaAgent, OllamaError
+from agent.ollama_agent import OllamaAgent, OllamaError, extract_promql_metric_names
 
 
 class FakeTool:
@@ -89,6 +89,24 @@ class FailingMCP(FakeMCP):
                 content=[SimpleNamespace(type="text", text="bad_data: test failure")],
             )
         return SimpleNamespace(is_error=False, structured_content={"ok": True}, content=[])
+
+
+class TextItem:
+    def __init__(self, text):
+        self.text = text
+
+    def model_dump(self, **_kwargs):
+        return {"type": "text", "text": self.text}
+
+
+class ResultMCP(FakeMCP):
+    def __init__(self, result):
+        super().__init__()
+        self.result = result
+
+    async def call_tool(self, name, arguments):
+        self.calls.append((name, arguments))
+        return self.result
 
 
 class AgentLoopTests(unittest.IsolatedAsyncioTestCase):
@@ -283,6 +301,23 @@ class AgentLoopTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaisesRegex(OllamaError, "length limit"):
             await agent.run("empty")
 
+    async def test_dashboard_empty_response_gets_one_bounded_retry(self):
+        responses = iter(
+            [
+                {"done": True, "done_reason": "stop", "message": {"role": "assistant", "content": ""}},
+                {"message": {"role": "assistant", "content": "continued"}},
+            ]
+        )
+
+        async def request(_payload):
+            return next(responses)
+
+        agent = OllamaAgent(self._settings(max_turns=2), FakeMCP(), ollama_request=request, progress=lambda _: None)
+        agent.tools = [{"type": "function"}]
+        agent.mcp_tool_names = set()
+        agent.tool_names = set()
+        self.assertEqual(await agent.run("Create a dashboard"), "continued")
+
     async def test_prewrite_discovery_budget_blocks_early(self):
         mcp = FakeMCP()
         agent = OllamaAgent(self._settings(max_turns=20), mcp, progress=lambda _: None)
@@ -312,6 +347,273 @@ class AgentLoopTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaisesRegex(OllamaError, "stuck in repetitive tool calls"):
             await agent.run("loop")
         self.assertLess(agent.inference_turns, 20)
+
+    def test_metric_catalog_capture_and_promql_grounding(self):
+        agent = OllamaAgent(self._settings(), FakeMCP(), progress=lambda _: None)
+        agent._capture_metric_catalog(
+            json.dumps(
+                {
+                    "content": [["demo_http_requests_total", "demo_cpu_usage_percent"]]
+                }
+            )
+        )
+        self.assertEqual(
+            agent._discovered_metric_names,
+            {"demo_http_requests_total", "demo_cpu_usage_percent"},
+        )
+        self.assertIsNone(
+            agent._promql_grounding_error("rate(demo_http_requests_total[5m])")
+        )
+        error = agent._promql_grounding_error("rate(demo_requests_total[5m])")
+        self.assertEqual(error["error"], "UNKNOWN_PROMETHEUS_METRIC")
+        self.assertIn("demo_http_requests_total", error["closest_matches"]["demo_requests_total"])
+
+    def test_promql_extractor_ignores_functions_labels_and_durations(self):
+        expression = (
+            "histogram_quantile(0.95, sum by (le) (rate("
+            "demo_http_request_duration_seconds_bucket[5m])))"
+        )
+        self.assertEqual(
+            extract_promql_metric_names(expression),
+            {"demo_http_request_duration_seconds_bucket"},
+        )
+
+    def test_raw_request_counter_is_rejected_for_request_rate(self):
+        agent = OllamaAgent(self._settings(), FakeMCP(), progress=lambda _: None)
+        agent._current_user_prompt = "Build a dashboard with request rate"
+        error = agent._query_semantic_error("demo_http_requests_total")
+        self.assertEqual(error["error"], "INVALID_PROMQL_SEMANTICS")
+
+    def test_raw_error_counter_is_rejected_for_error_percentage(self):
+        agent = OllamaAgent(self._settings(), FakeMCP(), progress=lambda _: None)
+        agent._current_user_prompt = "Correct the error percentage dashboard panel"
+        error = agent._query_semantic_error("demo_http_errors_total")
+        self.assertEqual(error["error"], "INVALID_PROMQL_SEMANTICS")
+
+    def test_valid_rate_expression_is_semantically_accepted(self):
+        agent = OllamaAgent(self._settings(), FakeMCP(), progress=lambda _: None)
+        agent._current_user_prompt = "Build a dashboard with request rate"
+        self.assertIsNone(
+            agent._query_semantic_error("rate(demo_http_requests_total[5m])")
+        )
+
+    def test_valid_error_percentage_expression_is_semantically_accepted(self):
+        agent = OllamaAgent(self._settings(), FakeMCP(), progress=lambda _: None)
+        agent._current_user_prompt = "Correct request rate and error percentage"
+        expression = (
+            "100 * rate(demo_http_errors_total[5m]) "
+            "/ rate(demo_http_requests_total[5m])"
+        )
+        self.assertIsNone(agent._query_semantic_error(expression))
+
+    def test_dashboard_write_cannot_finish_without_post_write_retrieval(self):
+        agent = OllamaAgent(self._settings(), FakeMCP(), progress=lambda _: None)
+        agent._prewrite_guard_enabled = True
+        agent._record_dashboard_write()
+        error = agent._dashboard_completion_error()
+        self.assertEqual(error["error"], "DASHBOARD_WRITE_NOT_VERIFIED")
+        self.assertIn("Retrieve", error["instruction"])
+
+    def test_post_write_retrieval_and_data_verification_allows_completion(self):
+        agent = OllamaAgent(self._settings(), FakeMCP(), progress=lambda _: None)
+        agent._prewrite_guard_enabled = True
+        agent._record_dashboard_write()
+        expression = "rate(demo_http_requests_total[5m])"
+        result_text = json.dumps(
+            {
+                "content": [
+                    {
+                        "dashboard": {
+                            "panels": [
+                                {
+                                    "title": "Request Rate",
+                                    "targets": [{"expr": expression}],
+                                }
+                            ]
+                        }
+                    }
+                ]
+            }
+        )
+        agent._record_dashboard_retrieval(result_text)
+        agent._validated_promql[expression] = {"returned_data": True}
+        agent._post_write_verified_expressions.add(expression)
+        self.assertIsNone(agent._dashboard_completion_error())
+
+    def test_nested_dashboard_retrieval_exposes_exact_patch_paths(self):
+        agent = OllamaAgent(self._settings(), FakeMCP(), progress=lambda _: None)
+        result_text = json.dumps(
+            {
+                "content": [
+                    {
+                        "dashboard": {
+                            "uid": "dashboard-uid",
+                            "dashboard": {
+                                "panels": [
+                                    {
+                                        "title": "Request Rate",
+                                        "targets": [{"expr": "demo_http_requests_total"}],
+                                    }
+                                ]
+                            },
+                        }
+                    }
+                ]
+            }
+        )
+        retrieved = json.loads(agent._record_dashboard_retrieval(result_text))
+        saved_query = retrieved["dashboard_verification"]["saved_panel_queries"][0]
+        self.assertEqual(
+            saved_query["patch_path"], "$.dashboard.panels[0].targets[0].expr"
+        )
+
+    async def test_correction_flow_rejects_old_semantics_and_accepts_verified_patch(self):
+        mcp = ResultMCP(
+            SimpleNamespace(is_error=False, structured_content=None, content=[])
+        )
+        agent = OllamaAgent(self._settings(), mcp, progress=lambda _: None)
+        agent._prewrite_guard_enabled = True
+        old_dashboard = json.dumps(
+            {
+                "content": [
+                    {
+                        "dashboard": {
+                            "panels": [
+                                {
+                                    "title": "Error Percentage",
+                                    "targets": [{"expr": "demo_http_errors_total"}],
+                                },
+                                {
+                                    "title": "Request Rate",
+                                    "targets": [{"expr": "demo_http_requests_total"}],
+                                },
+                            ]
+                        }
+                    }
+                ]
+            }
+        )
+        retrieved = json.loads(agent._record_dashboard_retrieval(old_dashboard))
+        self.assertEqual(
+            len(retrieved["dashboard_verification"]["semantic_errors"]), 2
+        )
+
+        request_rate = "rate(demo_http_requests_total[5m])"
+        error_percentage = (
+            "100 * rate(demo_http_errors_total[5m]) "
+            "/ rate(demo_http_requests_total[5m])"
+        )
+        agent._discovered_metric_names = {
+            "demo_http_errors_total",
+            "demo_http_requests_total",
+        }
+        for expression in (request_rate, error_percentage):
+            agent._validated_promql[expression] = {"returned_data": True}
+        patch = {
+            "uid": "dashboard-uid",
+            "operations": [
+                {
+                    "op": "replace",
+                    "path": "$.panels[0].targets[0].expr",
+                    "value": error_percentage,
+                },
+                {
+                    "op": "replace",
+                    "path": "$.panels[1].targets[0].expr",
+                    "value": request_rate,
+                },
+            ],
+        }
+        fingerprint = agent.tool_call_fingerprint("update_dashboard", patch)
+        await agent._dispatch_tool_call("update_dashboard", patch, fingerprint)
+        self.assertEqual([call[0] for call in mcp.calls], ["update_dashboard"])
+
+        corrected_dashboard = json.dumps(
+            {
+                "content": [
+                    {
+                        "dashboard": {
+                            "panels": [
+                                {"title": "Error Percentage", "targets": [{"expr": error_percentage}]},
+                                {"title": "Request Rate", "targets": [{"expr": request_rate}]},
+                            ]
+                        }
+                    }
+                ]
+            }
+        )
+        agent._record_dashboard_retrieval(corrected_dashboard)
+        agent._post_write_verified_expressions.update(
+            {request_rate, error_percentage}
+        )
+        self.assertIsNone(agent._dashboard_completion_error())
+
+    async def test_no_data_query_is_not_marked_validated(self):
+        result = SimpleNamespace(
+            is_error=False,
+            structured_content=None,
+            content=[TextItem(json.dumps({"data": [], "hints": {"summary": "no data"}}))],
+        )
+        mcp = ResultMCP(result)
+        agent = OllamaAgent(self._settings(), mcp, progress=lambda _: None)
+        agent._discovered_metric_names = {"demo_http_requests_total"}
+        args = {"datasourceUid": "prometheus", "expr": "demo_http_requests_total", "endTime": "now"}
+        fp = agent.tool_call_fingerprint("query_prometheus", args)
+        payload = json.loads(await agent._dispatch_tool_call("query_prometheus", args, fp))
+        self.assertEqual(payload["status"], "no_data")
+        self.assertEqual(agent._validated_promql, {})
+
+    async def test_dashboard_gate_blocks_unvalidated_expression(self):
+        mcp = ResultMCP(SimpleNamespace(is_error=False, structured_content=None, content=[]))
+        agent = OllamaAgent(self._settings(), mcp, progress=lambda _: None)
+        agent._discovered_metric_names = {"demo_http_requests_total"}
+        args = {
+            "dashboard": {
+                "title": "x",
+                "panels": [{"targets": [{"expr": "rate(demo_requests_total[5m])"}]}],
+            }
+        }
+        fp = agent.tool_call_fingerprint("update_dashboard", args)
+        payload = json.loads(await agent._dispatch_tool_call("update_dashboard", args, fp))
+        self.assertEqual(payload["error"], "UNKNOWN_PROMETHEUS_METRIC")
+        self.assertEqual(mcp.calls, [])
+
+    async def test_dashboard_gate_allows_only_validated_expression(self):
+        mcp = ResultMCP(SimpleNamespace(is_error=False, structured_content=None, content=[]))
+        agent = OllamaAgent(self._settings(), mcp, progress=lambda _: None)
+        expression = "rate(demo_http_requests_total[5m])"
+        agent._discovered_metric_names = {"demo_http_requests_total"}
+        agent._validated_promql[expression] = {
+            "expression": expression,
+            "returned_data": True,
+            "sample_count": 1,
+        }
+        args = {"dashboard": {"title": "x", "panels": [{"targets": [{"expr": expression}]}]}}
+        fp = agent.tool_call_fingerprint("update_dashboard", args)
+        await agent._dispatch_tool_call("update_dashboard", args, fp)
+        self.assertEqual([call[0] for call in mcp.calls], ["update_dashboard"])
+
+    async def test_grounding_state_resets_between_requests(self):
+        responses = iter([
+            {"message": {"role": "assistant", "content": "first"}},
+            {"message": {"role": "assistant", "content": "second"}},
+        ])
+
+        async def request(_payload):
+            return next(responses)
+
+        agent = OllamaAgent(self._settings(), FakeMCP(), ollama_request=request, progress=lambda _: None)
+        agent.tools = [{"type": "function"}]
+        agent.mcp_tool_names = set()
+        agent.tool_names = set()
+        agent._discovered_metric_names = {"stale_metric"}
+        agent._validated_promql["stale_metric"] = {"returned_data": True}
+        await agent.run("first")
+        self.assertEqual(agent._discovered_metric_names, set())
+        self.assertEqual(agent._validated_promql, {})
+        agent._discovered_metric_names = {"new_metric"}
+        await agent.run("second")
+        self.assertEqual(agent._discovered_metric_names, set())
 
     async def test_demo_client_dispatches_to_specific_api_endpoint(self):
         client = DemoScenarioClient("http://demo.invalid")

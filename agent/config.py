@@ -66,7 +66,7 @@ class Settings:
                 1, int(os.getenv("AGENT_MAX_PREWRITE_RECOVERY_BLOCKS", "3"))
             ),
             max_prewrite_turns=max(
-                1, int(os.getenv("AGENT_MAX_PREWRITE_TURNS", "8"))
+                1, int(os.getenv("AGENT_MAX_PREWRITE_TURNS", "12"))
             ),
             max_tool_result_chars=int(
                 os.getenv("AGENT_MAX_TOOL_RESULT_CHARS", "60000")
