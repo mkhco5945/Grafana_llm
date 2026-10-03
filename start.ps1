@@ -41,7 +41,7 @@ function Set-DotEnvValue([string]$Name, [string]$Value) {
     [System.IO.File]::WriteAllLines((Join-Path $ProjectRoot '.env'), $lines, [System.Text.UTF8Encoding]::new($false))
 }
 
-foreach ($command in 'docker', 'node', 'npm', 'py') {
+foreach ($command in 'docker', 'node', 'npm') {
     if (-not (Get-Command $command -ErrorAction SilentlyContinue)) {
         Stop-WithError "$command is not installed or not on PATH."
     }
@@ -50,6 +50,7 @@ if (-not (Test-Path -LiteralPath '.env')) {
     Copy-Item -LiteralPath '.env.example' -Destination '.env'
     Write-Host '[start] Created .env from .env.example.'
 }
+New-Item -ItemType Directory -Force -Path '.run', '.state' | Out-Null
 
 docker info *> $null
 if ($LASTEXITCODE -ne 0) {
@@ -113,10 +114,25 @@ if ([string]::IsNullOrWhiteSpace($callerToken) -or $callerToken -like 'replace-w
     Set-DotEnvValue 'MCP_GRAFANA_SERVER_TOKEN' (([BitConverter]::ToString($random) -replace '-', '').ToLowerInvariant())
 }
 
-Write-Host '[start] Starting Grafana MCP...'
-docker compose up -d mcp-grafana
-if ($LASTEXITCODE -ne 0) { Stop-WithError 'Docker could not start Grafana MCP.' }
+# Stop the obsolete host-side bridge from older versions before Docker binds
+# port 8010. The containerized bridge now survives terminal/logoff events and
+# restarts together with the rest of the stack.
+if (Test-Path -LiteralPath '.run\ai-api.pid') {
+    $oldPid = [int](Get-Content -LiteralPath '.run\ai-api.pid' -ErrorAction SilentlyContinue)
+    $oldProcess = Get-Process -Id $oldPid -ErrorAction SilentlyContinue
+    $legacyPython = Join-Path $ProjectRoot '.venv\Scripts\python.exe'
+    if ($oldProcess -and (Test-Path -LiteralPath $legacyPython) -and
+        $oldProcess.Path -eq (Resolve-Path -LiteralPath $legacyPython).Path) {
+        Stop-Process -Id $oldPid -ErrorAction SilentlyContinue
+    }
+    Remove-Item -LiteralPath '.run\ai-api.pid' -Force -ErrorAction SilentlyContinue
+}
+
+Write-Host '[start] Starting Grafana MCP and the persistent AI bridge...'
+docker compose up -d --build mcp-grafana ai-bridge
+if ($LASTEXITCODE -ne 0) { Stop-WithError 'Docker could not start Grafana MCP and AI bridge.' }
 Wait-Http 'http://127.0.0.1:8002/healthz'
+Wait-Http 'http://127.0.0.1:8010/health'
 
 # Grafana reads plugin metadata on startup. Reload it after each local build.
 docker compose restart grafana | Out-Null
@@ -134,33 +150,6 @@ try {
     }
 } catch { Stop-WithError 'Grafana is running, but the AI app could not be enabled. Check the admin/admin login.' }
 
-if (-not (Test-Path -LiteralPath '.venv\Scripts\python.exe')) {
-    Write-Host '[start] Creating the Windows Python environment...'
-    py -3 -m venv .venv
-    if ($LASTEXITCODE -ne 0) { Stop-WithError 'Could not create the Python virtual environment.' }
-}
-& '.\.venv\Scripts\python.exe' -c 'import httpx2, mcp, dotenv, jsonschema' 2>$null
-if ($LASTEXITCODE -ne 0) {
-    & '.\.venv\Scripts\python.exe' -m pip install -r requirements.txt
-    if ($LASTEXITCODE -ne 0) { Stop-WithError 'Python dependency installation failed.' }
-}
-
-New-Item -ItemType Directory -Force -Path '.run', '.state' | Out-Null
-if (Test-Path -LiteralPath '.run\ai-api.pid') {
-    $oldPid = [int](Get-Content -LiteralPath '.run\ai-api.pid' -ErrorAction SilentlyContinue)
-    $oldProcess = Get-Process -Id $oldPid -ErrorAction SilentlyContinue
-    $expectedPython = (Resolve-Path -LiteralPath '.venv\Scripts\python.exe').Path
-    if ($oldProcess -and $oldProcess.Path -eq $expectedPython) {
-        Stop-Process -Id $oldPid -ErrorAction SilentlyContinue
-    }
-}
-$stdoutLog = Join-Path $ProjectRoot '.run\ai-api.stdout.log'
-$stderrLog = Join-Path $ProjectRoot '.run\ai-api.stderr.log'
-$process = Start-Process -FilePath (Join-Path $ProjectRoot '.venv\Scripts\python.exe') `
-    -ArgumentList '-m', 'agent.api' -WorkingDirectory $ProjectRoot -WindowStyle Hidden -PassThru `
-    -RedirectStandardOutput $stdoutLog -RedirectStandardError $stderrLog
-[System.IO.File]::WriteAllText((Join-Path $ProjectRoot '.run\ai-api.pid'), "$($process.Id)")
-Wait-Http 'http://127.0.0.1:8010/health' 30
 $proxyDeadline = (Get-Date).AddSeconds(30)
 do {
     try {
@@ -180,4 +169,4 @@ Write-Host 'AI plugin:  http://localhost:3000/a/mkhco-ai-dashboard-app/'
 Write-Host 'Prometheus: http://localhost:9090'
 Write-Host 'Metrics:    http://localhost:8000/metrics'
 Write-Host 'MCP:        http://127.0.0.1:8002/mcp'
-Write-Host 'Logs:       .run\ai-api.stdout.log and .run\ai-api.stderr.log'
+Write-Host 'AI logs:    docker compose logs ai-bridge'

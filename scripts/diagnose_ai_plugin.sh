@@ -111,7 +111,7 @@ fi
 capture docker/compose-ps.txt docker compose ps || true
 capture docker/compose-ps-all.txt docker compose ps -a || true
 capture docker/container-state.txt sh -c '
-  for service in prometheus demo grafana mcp-grafana; do
+  for service in prometheus demo grafana mcp-grafana ai-bridge; do
     id=$(docker compose ps -q "$service" 2>/dev/null)
     if [ -n "$id" ]; then
       docker inspect --format "service=$service id={{.Id}} name={{.Name}} image={{.Config.Image}} status={{.State.Status}} health={{if .State.Health}}{{.State.Health.Status}}{{else}}n/a{{end}} started={{.State.StartedAt}}" "$id"
@@ -144,7 +144,7 @@ sha256sum "$REPORT_DIR/network/plugin-module.body" >"$REPORT_DIR/build/served-mo
 # proves rendering, so do not retain this potentially sensitive body.
 printf 'Grafana SPA HTML body intentionally omitted; see frontend/render.json.\n' >"$REPORT_DIR/network/app-page.body"
 
-# Host bridge request has no credentials.
+# Loopback bridge request has no credentials.
 set +e
 HOST_AI_STATUS="$(curl -sS --max-time 10 -D "$REPORT_DIR/network/host-ai.headers" \
   -o "$REPORT_DIR/network/host-ai.body" -w '%{http_code}' http://127.0.0.1:8010/health \
@@ -191,7 +191,7 @@ FRONTEND_RC=$?
 
 set +e
 docker compose exec -T grafana sh -c \
-  'wget -S -O- -T 10 http://host.docker.internal:8010/health' \
+  'wget -S -O- -T 10 http://ai-bridge:8010/health' \
   >"$REPORT_DIR/network/grafana-container-to-ai.txt" 2>&1
 CONTAINER_AI_RC=$?
 redact_stream <"$REPORT_DIR/network/grafana-container-to-ai.txt" >"$REPORT_DIR/network/grafana-container-to-ai.redacted"
@@ -202,18 +202,15 @@ set +e
 docker compose logs --no-color --tail=1200 grafana 2>&1 \
   | rg -i "$PLUGIN_ID|plugin-proxy|plugin proxy|plugin setting|provision|8010|status=(404|500|502|503)" \
   | redact_stream >"$REPORT_DIR/logs/grafana-filtered.log"
-for service in grafana mcp-grafana prometheus demo; do
+for service in grafana mcp-grafana prometheus demo ai-bridge; do
   docker compose logs --no-color --tail=250 "$service" 2>&1 \
     | redact_stream >"$REPORT_DIR/logs/docker-$service.log" || true
 done
-if [[ -f .run/ai-api.log ]]; then
-  tail -n 500 .run/ai-api.log | redact_stream >"$REPORT_DIR/logs/ai-api.log"
-  tail -n 1000 .run/ai-api.log | rg -i 'error|exception|failed|interrupted|traceback' \
-    | redact_stream >"$REPORT_DIR/logs/ai-api-errors.log" || true
-else
-  printf '.run/ai-api.log does not exist\n' >"$REPORT_DIR/logs/ai-api.log"
-  printf '.run/ai-api.log does not exist\n' >"$REPORT_DIR/logs/ai-api-errors.log"
-fi
+docker compose logs --no-color --tail=500 ai-bridge 2>&1 \
+  | redact_stream >"$REPORT_DIR/logs/ai-api.log" || true
+docker compose logs --no-color --tail=1000 ai-bridge 2>&1 \
+  | rg -i 'error|exception|failed|interrupted|traceback' \
+  | redact_stream >"$REPORT_DIR/logs/ai-api-errors.log" || true
 
 # Evaluate layers using only evidence collected above.
 BUILD_OK=0; [[ "$TYPECHECK_RC" == 0 && "$BUILD_RC" == 0 ]] && BUILD_OK=1
@@ -258,11 +255,11 @@ elif [[ "$MODULE_OK" == 0 ]]; then
   FIRST_FAILURE="module serving"
   LIKELY_CAUSE="Grafana registered the app but did not serve its module.js."
 elif [[ "$HOST_AI_OK" == 0 ]]; then
-  FIRST_FAILURE="host AI bridge"
-  LIKELY_CAUSE="The host AI bridge is not healthy on 127.0.0.1:8010."
+  FIRST_FAILURE="AI bridge"
+  LIKELY_CAUSE="The AI bridge is not healthy on 127.0.0.1:8010."
 elif [[ "$CONTAINER_AI_OK" == 0 ]]; then
-  FIRST_FAILURE="Grafana-to-host network"
-  LIKELY_CAUSE="The Grafana container cannot reach host.docker.internal:8010."
+  FIRST_FAILURE="Grafana-to-bridge network"
+  LIKELY_CAUSE="The Grafana container cannot reach ai-bridge:8010."
 elif [[ "$PROXY_OK" == 0 ]]; then
   FIRST_FAILURE="Grafana plugin proxy"
   if [[ "$PROXY_STATUS" == 404 ]] && rg -q 'plugin route match not found' "$REPORT_DIR/network/plugin-proxy.body"; then
@@ -311,7 +308,7 @@ cat >"$REPORT_DIR/summary.md" <<EOF
 | Plugin registered (HTTP $PLUGINS_STATUS) | $(pass_fail "$PLUGIN_REGISTERED") | \`network/grafana-plugins.*\` |
 | App setting enabled (HTTP $SETTINGS_STATUS) | $(pass_fail "$SETTINGS_ENABLED") | \`network/plugin-settings.*\` |
 | module.js served (HTTP $MODULE_STATUS) | $(pass_fail "$MODULE_OK") | \`network/plugin-module.*\` |
-| Host AI bridge (HTTP ${HOST_AI_STATUS:-000}) | $(pass_fail "$HOST_AI_OK") | \`network/host-ai.*\` |
+| AI bridge (HTTP ${HOST_AI_STATUS:-000}) | $(pass_fail "$HOST_AI_OK") | \`network/host-ai.*\` |
 | Grafana container to AI bridge | $(pass_fail "$CONTAINER_AI_OK") | \`network/grafana-container-to-ai.txt\` |
 | Plugin proxy (HTTP $PROXY_STATUS) | $(pass_fail "$PROXY_OK") | \`network/plugin-proxy.*\` |
 | Persistence stats APIs (host HTTP $BRIDGE_STATS_STATUS, proxy HTTP $PROXY_STATS_STATUS) | $(pass_fail "$STATS_OK") | \`state/bridge-stats.json\`, \`network/plugin-proxy-stats.*\` |

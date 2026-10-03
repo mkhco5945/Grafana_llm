@@ -27,6 +27,10 @@ export function ChatSurfaceStyles() {
     .mkhco-chat-content blockquote { margin: 10px 0; padding-inline-start: 12px;
       border-inline-start: 3px solid rgba(87,148,242,.65); opacity: .9; }
     .mkhco-chat-content a { color: #6aa9ff; }
+    @media (max-width: 1180px) {
+      .mkhco-ai-page { grid-template-columns: minmax(0, 1fr) !important; }
+      .mkhco-ai-chat-panel { max-height: 75vh !important; }
+    }
   `}</style>;
 }
 

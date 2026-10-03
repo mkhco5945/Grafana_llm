@@ -173,8 +173,9 @@ function GlobalChatSidebar() {
         </div>
         <div style={{ display: 'flex', gap: 8, marginTop: 10 }}>
           <select aria-label="گفت‌وگو" dir="auto" value={selectedId} onChange={event => setSelectedId(event.target.value)}
-            style={{ flex: 1, minWidth: 0, padding: 7, color: 'inherit', background: colors.background.secondary,
-              border: `1px solid ${colors.border.medium}`, borderRadius: 4 }}>
+            style={{ flex: 1, minWidth: 0, height: 38, minHeight: 38, boxSizing: 'border-box', padding: '0 10px',
+              lineHeight: 'normal', fontSize: 14, fontFamily: 'inherit', appearance: 'auto', color: 'inherit',
+              background: colors.background.secondary, border: `1px solid ${colors.border.medium}`, borderRadius: 6 }}>
             {sessions.map(item => <option key={item.id} value={item.id}>{item.title}</option>)}
           </select>
           <Button size="sm" onClick={() => void newChat()}>گفت‌وگوی جدید</Button>

@@ -7,7 +7,7 @@ The CLI and Grafana plugin use the same agent with two transports:
 
 Both retain MCP tool allowlists, live metric discovery, PromQL checks, dashboard write
 gating and post-write verification. The external model does not need inbound access
-to Grafana: the local Python bridge executes tools and sends their results back.
+to Grafana: the containerized Python bridge executes tools and sends their results back.
 `update_dashboard` is present in the model's tool schema from the first inference
 turn. The bridge still rejects the write until the referenced metrics are discovered
 and every panel query has returned live data. Persian dashboard verbs such as
@@ -15,8 +15,10 @@ and every panel query has returned live data. Persian dashboard verbs such as
 
 ## Run without Ollama
 
-Use WSL/Linux for `start.sh`. Install Docker Compose, Python >=3.10, uv, Node >=22,
-npm and curl. Ollama and model downloads are **not required** in external mode.
+Use WSL/Linux for `start.sh`. Install Docker Compose, Node >=22, npm and curl.
+Python runs inside the AI bridge container; install Python >=3.10 and uv on the
+host only if you also want the optional CLI. Ollama and model downloads are
+**not required** in external mode.
 
 Keep the two Grafana/MCP tokens configured as described in the main README.
 Set this in `.env` (copy `.env.example` for a fresh installation):
@@ -53,8 +55,8 @@ website or a browser login. Responses-only models/endpoints, Azure-specific API-
 headers and proprietary protocols are not implemented by this transport.
 
 For persistent server defaults and CLI use, fill `OPENAI_API_KEY` and
-`OPENAI_MODEL` in `.env`. Restart via `bash start.sh` after changes. It detects `.env`
-changes and restarts the bridge; active jobs become interrupted and can be retried.
+`OPENAI_MODEL` in `.env`. Restart via `bash start.sh` after changes. Compose recreates
+the bridge with the new environment; active jobs become interrupted and can be retried.
 Environment variables take precedence over `.env`.
 
 ```bash
@@ -119,8 +121,8 @@ documented MCP allowlist, even when the signed-in user is a Grafana administrato
 - A request already running continues if you leave the page. After bridge restart,
   interrupted requests can use Retry with the saved Grafana connection.
 - External mode sends prompts, recent conversation context and queried monitoring
-  data to the chosen provider. Keep the local bridge on a trusted development host;
-  its existing HTTP port is not an independently authenticated public service.
+  data to the chosen provider. The bridge port is bound only to host loopback and is
+  not an independently authenticated public service.
 - `.env` is git-ignored. Keep API keys out of screenshots and diagnostic reports.
   `start.sh` and `start.ps1` preserve existing Grafana plugin settings on restart.
 

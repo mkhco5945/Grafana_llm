@@ -11,7 +11,7 @@ It provides:
   readable tables, and isolated left-to-right code/PromQL blocks;
 - a Grafana command-palette action with the same name;
 - a dashboard panel-menu link back to the AI builder;
-- live polling of host-side agent progress;
+- live polling of containerized agent progress;
 - server-side conversation history backed by `.state/ai-chat.sqlite3`;
 - recovery and retry of jobs interrupted by an AI bridge restart;
 - an admin-only **AI connection** form that persists provider, external API base URL,
@@ -24,7 +24,7 @@ rest, and are injected into local bridge requests by Grafana's server-side proxy
 They are not returned to the browser. `.env` remains a fallback for CLI/server defaults.
 Jobs retain provider/model/endpoint metadata without keys.
 
-The plugin never talks directly to Ollama or MCP from the browser. Requests go through Grafana's plugin proxy to the local host-side `agent.api` service, which reuses the same grounded agent and MCP permissions as the CLI.
+The plugin never talks directly to Ollama or MCP from the browser. Requests go through Grafana's plugin proxy to the Compose `ai-bridge` service, which reuses the same grounded agent and MCP permissions as the CLI.
 
 Dashboard writes are advertised to tool-capable models from the first turn, including
 for Persian requests. The local bridge blocks the actual write until metric discovery

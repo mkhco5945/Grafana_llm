@@ -15,4 +15,4 @@ if (Test-Path -LiteralPath '.run\ai-api.pid') {
     Remove-Item -LiteralPath '.run\ai-api.pid' -Force
 }
 if (Get-Command docker -ErrorAction SilentlyContinue) { docker compose stop }
-Write-Host 'Docker services and the Windows AI bridge stopped. Grafana, Prometheus and chat data were preserved.'
+Write-Host 'Docker services stopped. Grafana, Prometheus and chat data were preserved.'

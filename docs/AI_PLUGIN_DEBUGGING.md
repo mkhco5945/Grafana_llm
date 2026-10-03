@@ -5,7 +5,7 @@
 ```text
 Grafana app (/a/mkhco-ai-dashboard-app)
   -> Grafana plugin proxy (/api/plugin-proxy/mkhco-ai-dashboard-app/ai/*)
-  -> host agent.api (host.docker.internal:8010)
+  -> ai-bridge container (ai-bridge:8010)
   -> SQLite (.state/ai-chat.sqlite3)
   -> Ollama or OpenAI-compatible API + mcp-grafana -> Grafana/Prometheus
 ```
@@ -28,8 +28,8 @@ Relevant Grafana 12.1.1 source:
 ## Persistent conversations
 
 For provider selection and key handling see [MODEL_PROVIDERS.md](MODEL_PROVIDERS.md).
-The current plugin version is `0.3.0`; the `0.2.0` discussion above records the
-original cache fix. Current smoke checks expect `module.js?_cache=0.3.0`.
+The current plugin version is `0.5.0`; the `0.2.0` discussion above records the
+original cache fix. Current smoke checks expect `module.js?_cache=0.5.0`.
 `GET /connection` exposes defaults and a boolean key-presence indicator, never the
 key. Chat and retry requests accept a `connection` object with provider, base URL,
 model and optional API key. Jobs persist only the non-secret fields.
@@ -45,7 +45,7 @@ SQLite is the source of truth for sessions, messages, jobs, progress, results, e
 
 Leaving the Grafana page does not stop the Python worker. Returning to the page reloads the session and resumes polling its active job. Completed answers are inserted with a unique job ID, preventing duplicate assistant messages.
 
-If the AI bridge process restarts, startup converts stale `queued`/`running` jobs to `interrupted`. The original request and prior messages remain, and the UI offers **Retry**. Completed conversations survive browser, Grafana, and bridge restarts.
+If the AI bridge container restarts, startup converts stale `queued`/`running` jobs to `interrupted`. The original request and prior messages remain, and the UI offers **Retry**. Completed conversations survive browser, Grafana, and bridge restarts. Compose uses `restart: unless-stopped`, and `.state/ai-chat.sqlite3` is mounted from the project directory.
 
 On first successful load, the frontend looks for `mkhco-ai-dashboard-app.chat.v1`, imports useful messages into one SQLite session, and marks migration complete. It does not delete or overwrite the old localStorage value. Browser localStorage cannot be recovered server-side if that browser no longer has it.
 
@@ -78,7 +78,7 @@ The collector does not read `.env`, dump environments, or include chat messages/
 
 ## Start, stop, and intentional deletion
 
-`start.sh` never erases `.state/ai-chat.sqlite3`. It restarts the bridge when bridge code or `.env` changed, or `AI_BRIDGE_FORCE_RESTART=1` is set. `stop.sh` stops processes but preserves chat history.
+`start.sh` never erases `.state/ai-chat.sqlite3`. It builds and starts the `ai-bridge` service with the rest of the Compose stack. `stop.sh` stops the containers but preserves chat history.
 
 To intentionally erase all chat history, first run `./stop.sh`, then move `.state/ai-chat.sqlite3` and its `-wal`/`-shm` companions to a backup location or delete those three files explicitly. This is deliberately not part of either normal script.
 

@@ -1,0 +1,9 @@
+.git
+.venv
+.run
+.state
+grafana-ai-plugin/node_modules
+grafana-ai-plugin/dist
+**/__pycache__
+**/*.pyc
+

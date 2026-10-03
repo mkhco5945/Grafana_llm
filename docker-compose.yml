@@ -71,7 +71,7 @@ services:
       - --endpoint-path
       - /mcp
       - --allowed-hosts
-      - localhost:8000,127.0.0.1:8000,localhost:8002,127.0.0.1:8002
+      - localhost:8000,127.0.0.1:8000,localhost:8002,127.0.0.1:8002,mcp-grafana:8000
       - --disable-assistant
     environment:
       GRAFANA_URL: http://grafana:3000
@@ -81,6 +81,37 @@ services:
       - "127.0.0.1:8002:8000"
     healthcheck:
       test: ["CMD", "/usr/bin/bash", "-c", "exec 3<>/dev/tcp/127.0.0.1/8000; printf 'GET /healthz HTTP/1.1\\r\\nHost: localhost:8000\\r\\nConnection: close\\r\\n\\r\\n' >&3; grep -q '200 OK' <&3"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    restart: unless-stopped
+
+  ai-bridge:
+    build:
+      context: .
+      dockerfile: agent/Dockerfile
+    depends_on:
+      demo:
+        condition: service_healthy
+      mcp-grafana:
+        condition: service_healthy
+    env_file:
+      - .env
+    environment:
+      AI_API_HOST: 0.0.0.0
+      AI_API_PORT: 8010
+      AI_CHAT_DB_PATH: /app/.state/ai-chat.sqlite3
+      MCP_GRAFANA_URL: http://mcp-grafana:8000/mcp
+      DEMO_API_URL: http://demo:8000
+      OLLAMA_URL: ${OLLAMA_CONTAINER_URL:-http://host.docker.internal:11434}
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    volumes:
+      - ./.state:/app/.state
+    ports:
+      - "127.0.0.1:8010:8010"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8010/health', timeout=2)"]
       interval: 5s
       timeout: 3s
       retries: 20

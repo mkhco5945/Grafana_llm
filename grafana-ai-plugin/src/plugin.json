@@ -32,7 +32,7 @@
   "routes": [
     {
       "path": "ai/*",
-      "url": "http://host.docker.internal:8010",
+      "url": "http://ai-bridge:8010",
       "reqSignedIn": true,
       "reqRole": "Editor",
       "headers": [

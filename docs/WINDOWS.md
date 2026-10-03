@@ -1,15 +1,15 @@
 # Windows setup without WSL
 
 This project can run from PowerShell without installing an Ubuntu distribution.
-Docker still runs the Linux Grafana, Prometheus, demo and MCP containers. Docker
-Desktop's **Docker VMM** supplies their small Linux VM; the Python AI bridge runs
-as a normal hidden Windows process.
+Docker runs the Linux Grafana, Prometheus, demo, MCP and AI bridge containers.
+Docker Desktop's **Docker VMM** supplies their small Linux VM. The `ai-bridge`
+service restarts with the stack and does not depend on a hidden Windows process.
 
 Requirements:
 
 - Windows 10/11 with hardware virtualization enabled and at least 8 GB RAM.
 - Docker Desktop 4.86 or later, using Docker VMM (Beta) with at least 4 GB RAM.
-- Node.js 22 or later, npm, and Python 3.10 or later (`py`).
+- Node.js 22 or later and npm. Python is included in the AI bridge image.
 
 Install Docker Desktop in per-user mode. Start it, open **Settings > General >
 Virtual Machine Manager**, select **Docker VMM**, and choose **Apply & restart**.
@@ -55,12 +55,12 @@ deleting data:
 powershell -ExecutionPolicy Bypass -File .\stop.ps1
 ```
 
-Logs are `.run\ai-api.stdout.log` and `.run\ai-api.stderr.log`. Useful checks:
+Useful checks:
 
 ```powershell
 docker compose ps
-docker compose logs --tail=100 grafana mcp-grafana
-Get-Content .run\ai-api.stderr.log -Tail 100
+docker compose logs --tail=100 grafana mcp-grafana ai-bridge
+Invoke-RestMethod http://127.0.0.1:8010/health
 ```
 
 Normal data persists in Docker named volumes and `.state\ai-chat.sqlite3`.

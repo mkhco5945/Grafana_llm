@@ -24,9 +24,9 @@ const ACTIVE_SESSION_KEY = 'mkhco-ai-dashboard-app.active-session.v2';
 const DRAFTS_KEY = 'mkhco-ai-dashboard-app.drafts.v2';
 
 const starterPrompts = [
-  'Inspect the live demo data and tell me what looks abnormal right now.',
-  'Create a new Grafana dashboard called AI Demo Service Health using the live demo Prometheus metrics. Use useful modern panels, validate every PromQL query, create it through Grafana MCP, then verify it and give me the URL.',
-  'Show me one actual raw CPU sample from Prometheus and tell me its unit.',
+  'داده‌های زنده را بررسی کن و بگو الان چه چیزی غیرعادی است.',
+  'با متریک‌های واقعی Prometheus یک داشبورد سلامت سرویس بساز، همه کوئری‌ها را اعتبارسنجی کن و لینک نتیجه را بده.',
+  'یک نمونه واقعی از مصرف CPU را از Prometheus بخوان و واحد آن را توضیح بده.',
 ];
 
 const pageStyle: CSSProperties = {
@@ -159,7 +159,7 @@ export default function App() {
             const migrated = await importLegacyChat(legacy);
             migratedSessionId = migrated.session.id;
             setMigrationNotice(
-              migrated.already_imported ? 'Your browser chat was already imported.' : 'Your previous browser chat was imported to SQLite.'
+              migrated.already_imported ? 'گفت‌وگوی قبلی مرورگر از قبل منتقل شده بود.' : 'گفت‌وگوی قبلی مرورگر به SQLite منتقل شد.'
             );
           }
           // Preserve the old key for manual recovery; this marker only prevents duplicate imports.
@@ -275,6 +275,8 @@ export default function App() {
   }, [session]);
   const working = submitting || latestJob?.status === 'queued' || latestJob?.status === 'running';
   const messages = session?.messages || [];
+  const activeError = error || latestJob?.error || '';
+  const errorSummary = activeError.length > 220 ? `${activeError.slice(0, 220)}…` : activeError;
 
   const send = async (text?: string) => {
     const message = (text ?? input).trim();
@@ -326,30 +328,31 @@ export default function App() {
   };
 
   return (
-    <div data-testid="ai-dashboard-builder-root" style={pageStyle}>
-      <main style={{ ...panelStyle, padding: 24, minHeight: 620 }}>
+    <div className="mkhco-ai-page" data-testid="ai-dashboard-builder-root" style={pageStyle}>
+      <ChatSurfaceStyles />
+      <main dir="rtl" style={{ ...panelStyle, padding: 24, minHeight: 620 }}>
         <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 12 }}>
           <div>
-            <h1 style={{ marginTop: 0 }}>AI Dashboard Builder</h1>
+            <h1 style={{ marginTop: 0 }}>سازنده داشبورد با هوش مصنوعی</h1>
             <p style={{ maxWidth: 760, opacity: 0.8 }}>
-              Use local Ollama or an OpenAI-compatible API with the Grafana MCP agent. The model discovers real metrics,
-              validates PromQL, writes dashboards through MCP, and verifies saved queries before claiming success.
+              با Ollama محلی یا سرویس OpenAI-compatible به داده‌های واقعی Grafana متصل شوید. عامل، متریک‌ها را کشف می‌کند،
+              PromQL را می‌آزماید، داشبورد را می‌سازد و نتیجه ذخیره‌شده را دوباره بررسی می‌کند.
             </p>
           </div>
           <div style={{ fontSize: 13, opacity: 0.8 }}>
-            AI bridge: {connected === null ? 'checking…' : connected ? 'connected' : 'offline'}
+            سرویس AI: {connected === null ? 'در حال بررسی…' : connected ? 'متصل' : 'قطع'}
           </div>
         </div>
 
         {connected === false && (
-          <Alert title="Local AI bridge is offline" severity="error">
-            Run ./start.sh and check .run/ai-api.log.
+          <Alert title="سرویس AI در دسترس نیست" severity="error">
+            وضعیت کانتینر را با دستور docker compose logs ai-bridge بررسی کنید.
           </Alert>
         )}
-        {migrationNotice && <Alert title="Chat migration complete" severity="success">{migrationNotice}</Alert>}
+        {migrationNotice && <Alert title="انتقال تاریخچه چت کامل شد" severity="success">{migrationNotice}</Alert>}
 
         <ModelSettings value={connection} onChange={setConnection} disabled={working} />
-        <h3>Try it</h3>
+        <h3>پیشنهاد برای شروع</h3>
         <div style={{ display: 'grid', gap: 10, maxWidth: 900 }}>
           {starterPrompts.map((prompt) => (
             <button
@@ -358,7 +361,7 @@ export default function App() {
               onClick={() => void send(prompt)}
               disabled={working || !selectedSessionId}
               style={{
-                textAlign: 'left',
+                textAlign: 'start',
                 border: '1px solid rgba(128,128,128,0.28)',
                 borderRadius: 8,
                 background: 'transparent',
@@ -373,26 +376,25 @@ export default function App() {
         </div>
 
         <div style={{ marginTop: 28 }}>
-          <h3>Persistent conversations</h3>
+          <h3>گفت‌وگوهای ماندگار</h3>
           <p style={{ opacity: 0.8 }}>
-            Messages, progress, model selection, results, and dashboard links are stored by the local AI bridge in SQLite. You can
-            navigate away, close the browser, or restart Grafana and reopen any chat from the history list.
+            پیام‌ها، نتیجه‌ها و لینک داشبوردها در SQLite ذخیره می‌شوند. می‌توانید صفحه یا مرورگر را ببندید و بعداً
+            گفت‌وگو را از همین فهرست ادامه دهید.
           </p>
           <p style={{ opacity: 0.8 }}>
-            A running Python worker continues when you leave this page. If the AI bridge itself restarts, its saved request becomes
-            interrupted and can be retried safely from this conversation.
+            AI bridge اکنون داخل Docker اجرا می‌شود و همراه stack به‌صورت خودکار برمی‌گردد. اگر اجرای فعالی هنگام restart قطع شود،
+            همان درخواست از داخل گفت‌وگو قابل تکرار است.
           </p>
         </div>
 
         {latestJob?.dashboard_url && (
           <div style={{ marginTop: 24 }}>
-            <Button onClick={() => (window.location.href = latestJob.dashboard_url)}>Open created dashboard</Button>
+            <Button onClick={() => (window.location.href = latestJob.dashboard_url)}>بازکردن داشبورد ساخته‌شده</Button>
           </div>
         )}
       </main>
 
-      <aside dir="rtl" style={{ ...panelStyle, minHeight: 620, maxHeight: 'calc(100vh - 110px)', display: 'flex', flexDirection: 'column', overflow: 'hidden' }}>
-        <ChatSurfaceStyles />
+      <aside className="mkhco-ai-chat-panel" dir="rtl" style={{ ...panelStyle, minHeight: 620, maxHeight: 'calc(100vh - 110px)', display: 'flex', flexDirection: 'column', overflow: 'hidden' }}>
         <div style={{ padding: 14, borderBottom: '1px solid rgba(128,128,128,0.25)' }}>
           <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 12 }}>
             <strong style={{ fontSize: 16 }}>گفت‌وگوها</strong>
@@ -467,11 +469,19 @@ export default function App() {
           </details>
         ) : null}
 
-        {(error || latestJob?.error) && (
+        {activeError && (
           <div style={{ padding: '0 16px 10px' }}>
             <Alert title={latestJob?.status === 'interrupted' ? 'اجرای هوش مصنوعی متوقف شد' : 'درخواست هوش مصنوعی ناموفق بود'} severity="error">
-              {error || latestJob?.error}
+              <span dir="auto">{errorSummary}</span>
             </Alert>
+            {activeError.length > 220 && (
+              <details style={{ marginTop: 7 }}>
+                <summary style={{ cursor: 'pointer', fontSize: 12 }}>جزئیات فنی خطا</summary>
+                <pre dir="ltr" style={{ maxHeight: 130, overflow: 'auto', whiteSpace: 'pre-wrap', textAlign: 'left', fontSize: 11 }}>
+                  {activeError}
+                </pre>
+              </details>
+            )}
             {latestJob && ['failed', 'interrupted'].includes(latestJob.status) && (
               <div style={{ marginTop: 8 }}><Button onClick={() => void retry()} disabled={submitting}>تلاش دوباره</Button></div>
             )}

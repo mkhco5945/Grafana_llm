@@ -13,4 +13,4 @@ fi
 
 docker compose stop
 
-echo "Docker services and the local AI bridge were stopped; persistent Grafana, Prometheus, and .state/ai-chat.sqlite3 chat data were kept. Ollama was not stopped."
+echo "Docker services were stopped; persistent Grafana, Prometheus, and .state/ai-chat.sqlite3 chat data were kept. Ollama was not stopped."

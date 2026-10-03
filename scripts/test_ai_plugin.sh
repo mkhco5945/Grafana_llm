@@ -69,7 +69,7 @@ echo 'PASS: plugin typecheck/build and runtime imports'
 
 phase 2 'Start stack and verify Grafana health'
 AI_PLUGIN_ALREADY_BUILT=1 AI_PLUGIN_SKIP_PROXY_CHECK=1 ./start.sh \
-  || fail 'Local stack or host AI bridge startup failed'
+  || fail 'Local stack or AI bridge startup failed'
 status="$(http_get "$GRAFANA_URL/api/health" .run/smoke-grafana-health.body)"
 [[ "$status" == 200 ]] || fail "Grafana health returned HTTP ${status:-000}"
 echo 'PASS: Grafana is healthy'
@@ -103,26 +103,26 @@ cmp -s grafana-ai-plugin/dist/module.js .run/smoke-served-module.js \
   || fail 'module.js served by Grafana differs from the fresh build'
 echo 'PASS: source metadata and built/mounted/served plugin bytes match'
 
-phase 5 'Host AI bridge and SQLite persistence health'
+phase 5 'AI bridge and SQLite persistence health'
 status="$(curl -sS --max-time 10 -o .run/smoke-host-ai.body -w '%{http_code}' \
   http://127.0.0.1:8010/health 2>.run/smoke-host-ai.error || true)"
-[[ "$status" == 200 ]] || fail "Host AI bridge returned HTTP ${status:-000}"
+[[ "$status" == 200 ]] || fail "AI bridge returned HTTP ${status:-000}"
 rg -q '"database"[[:space:]]*:[[:space:]]*"ok"' .run/smoke-host-ai.body \
   || fail 'AI bridge health did not report database=ok'
 [[ -s .state/ai-chat.sqlite3 ]] || fail 'Persistent chat database .state/ai-chat.sqlite3 does not exist'
 status="$(curl -sS --max-time 10 -o .run/smoke-stats.body -w '%{http_code}' http://127.0.0.1:8010/stats || true)"
 [[ "$status" == 200 ]] || fail "AI bridge persistence stats returned HTTP ${status:-000}"
-echo 'PASS: host AI bridge and SQLite database are healthy'
+echo 'PASS: AI bridge and SQLite database are healthy'
 
-phase 6 'Grafana container to host AI bridge network'
+phase 6 'Grafana container to AI bridge network'
 if ! docker compose exec -T grafana sh -c \
-  'wget -q -O- -T 10 http://host.docker.internal:8010/health' \
+  'wget -q -O- -T 10 http://ai-bridge:8010/health' \
   >.run/smoke-container-ai.body 2>.run/smoke-container-ai.error; then
-  fail 'Grafana container cannot reach host.docker.internal:8010/health'
+  fail 'Grafana container cannot reach ai-bridge:8010/health'
 fi
 rg -q '"ok"[[:space:]]*:[[:space:]]*true' .run/smoke-container-ai.body \
   || fail 'Grafana container reached the AI bridge but got an invalid health body'
-echo 'PASS: Grafana container can reach the host AI bridge'
+echo 'PASS: Grafana container can reach the AI bridge'
 
 phase 7 'Grafana plugin proxy'
 status="$(http_get "$PROXY_BASE/health" .run/smoke-proxy.body)"
@@ -178,8 +178,8 @@ rg -q '"markerVisible"[[:space:]]*:[[:space:]]*true' .run/smoke-frontend.json \
   || fail 'Rendered Grafana page is missing data-testid=ai-dashboard-builder-root'
 rg -q '"appNotFoundVisible"[[:space:]]*:[[:space:]]*false' .run/smoke-frontend.json \
   || fail 'Rendered Grafana page shows App not found'
-rg -q 'module.js\?_cache=0.3.0' .run/smoke-frontend.json \
-  || fail 'Browser did not load the cache-busted 0.3.0 plugin module'
+rg -q 'module.js\?_cache=0.5.0' .run/smoke-frontend.json \
+  || fail 'Browser did not load the cache-busted 0.5.0 plugin module'
 rg -q '"assistantMessageCount"[[:space:]]*:[[:space:]]*[1-9]' .run/smoke-frontend.json \
   || fail 'Rendered Grafana page did not restore the persisted assistant response'
 echo 'PASS: real browser rendered the root marker and server-restored assistant response without App not found'
@@ -189,8 +189,13 @@ status="$(curl -sS --max-time 10 -o .run/smoke-restart-stats.body -w '%{http_cod
 [[ "$status" == 200 ]] || fail "Could not check active jobs before AI bridge restart (HTTP ${status:-000})"
 active_jobs="$(python3 -c 'import json; data=json.load(open(".run/smoke-restart-stats.body")); print(sum(data.get("jobs_by_status",{}).get(k,0) for k in ("queued","running")))')"
 [[ "$active_jobs" == 0 ]] || fail "Refusing to restart AI bridge while $active_jobs job(s) are active"
-AI_BRIDGE_FORCE_RESTART=1 AI_PLUGIN_ALREADY_BUILT=1 AI_PLUGIN_SKIP_PROXY_CHECK=1 ./start.sh \
+docker compose restart ai-bridge \
   || fail 'AI bridge restart failed during persistence verification'
+restart_deadline=$((SECONDS + 60))
+until [[ "$(curl -sS --max-time 3 -o /dev/null -w '%{http_code}' http://127.0.0.1:8010/health 2>/dev/null || true)" == 200 ]]; do
+  (( SECONDS < restart_deadline )) || fail 'AI bridge did not become healthy after restart'
+  sleep 1
+done
 echo 'PASS: AI bridge restarted without deleting the chat database'
 
 phase 12 'Reload the completed conversation after bridge restart'
@@ -230,4 +235,4 @@ echo
 echo '=== AI PLUGIN SMOKE TEST: PASS ==='
 echo "Open: $GRAFANA_URL/a/$PLUGIN_ID"
 echo 'Persistent chats: .state/ai-chat.sqlite3'
-echo "AI bridge log: $ROOT_DIR/.run/ai-api.log"
+echo "AI bridge logs: docker compose logs ai-bridge"
