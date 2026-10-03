@@ -14,6 +14,7 @@ from .chat_store import ChatStore
 from .config import Settings
 from .mcp_client import GrafanaMCPClient
 from .ollama_agent import OllamaAgent
+from .openai_client import validate_base_url
 
 
 STORE: ChatStore | None = None
@@ -27,7 +28,7 @@ def _store() -> ChatStore:
 
 def _is_dashboard_write_request(message: str) -> bool:
     lowered = message.lower()
-    if "dashboard" not in lowered:
+    if not any(word in lowered for word in ("dashboard", "داشبورد")):
         return False
     return any(
         token in lowered
@@ -43,11 +44,24 @@ def _is_dashboard_write_request(message: str) -> bool:
             "change",
             "remove",
             "delete",
+            "save",
+            "بساز",
+            "ساخت",
+            "ایجاد",
+            "ذخیره",
+            "ویرایش",
+            "تغییر",
+            "اصلاح",
+            "آپدیت",
+            "به‌روز",
+            "بروز",
         )
     )
 
 
 def _selected_model(message: str, settings: Settings) -> str:
+    if settings.llm_provider == "openai":
+        return settings.openai_model
     if _is_dashboard_write_request(message):
         return os.getenv("AI_DASHBOARD_MODEL", "qwen3:8b").strip() or settings.ollama_model
     return os.getenv("AI_FAST_MODEL", "qwen3:4b").strip() or settings.ollama_model
@@ -73,23 +87,78 @@ def _conversation_prompt(message: str, history: list[dict[str, Any]]) -> str:
 
 
 def _extract_dashboard_url(answer: str) -> str:
-    absolute = re.search(r"https?://[^\s]+(/d/[A-Za-z0-9_-]+/[^\s)]+)", answer)
-    if absolute:
-        return absolute.group(1).rstrip(".,")
-    relative = re.search(r"(/d/[A-Za-z0-9_-]+/[^\s)]+)", answer)
+    # Return a Grafana-relative link even when the answer contains an absolute
+    # URL. Markdown delimiters must not become part of the button target.
+    relative = re.search(r"(/d/[A-Za-z0-9_-]+/[^\s)`'\"<>\]]+)", answer)
     if relative:
-        return relative.group(1).rstrip(".,")
+        return relative.group(1).rstrip(".,;:")
     return ""
 
 
-async def _run_agent(job_id: str) -> None:
+def _configured_settings(defaults: Any = None) -> Settings:
+    settings = Settings.from_env()
+    if defaults is None:
+        return settings
+    if not isinstance(defaults, dict):
+        raise ValueError("connection defaults must be an object")
+    for key in ("provider", "base_url", "model", "api_key"):
+        if key in defaults and not isinstance(defaults[key], str):
+            raise ValueError(f"connection default {key} must be a string")
+    provider = defaults.get("provider", "").strip() or settings.llm_provider
+    if provider not in {"ollama", "openai"}:
+        provider = settings.llm_provider
+    environment_base_url = settings.openai_base_url.rstrip("/")
+    base_url = defaults.get("base_url", "").strip().rstrip("/") or environment_base_url
+    model = defaults.get("model", "").strip() or settings.openai_model
+    api_key = defaults.get("api_key", "").strip()
+    if not api_key and base_url == environment_base_url:
+        api_key = settings.openai_api_key
+    return replace(settings, llm_provider=provider, openai_base_url=base_url,
+                   openai_model=model, openai_api_key=api_key)
+
+
+def _connection_settings(message: str, options: Any = None, defaults: Any = None) -> Settings:
+    settings = _configured_settings(defaults)
+    if options is None:
+        options = {}
+    if not isinstance(options, dict):
+        raise ValueError("connection must be an object")
+    for key in ("provider", "base_url", "model", "api_key"):
+        if key in options and not isinstance(options[key], str):
+            raise ValueError(f"connection.{key} must be a string")
+    provider = options.get("provider", settings.llm_provider)
+    if provider not in {"ollama", "openai"}:
+        raise ValueError("provider must be ollama or openai")
+    settings = replace(settings, llm_provider=provider)
+    model = options.get("model", "").strip() or _selected_model(message, settings)
+    if not model or len(model) > 200 or any(ord(c) < 32 for c in model):
+        raise ValueError("Choose a valid model name")
+    if provider == "ollama":
+        return replace(settings, ollama_model=model)
+    base = validate_base_url(options.get("base_url") or settings.openai_base_url)
+    # A custom destination must never inherit the server's secret for another host/path.
+    key = options.get("api_key", "").strip()
+    if not key and base == settings.openai_base_url.rstrip("/"):
+        key = settings.openai_api_key
+    if not key:
+        raise ValueError("Enter an API key for this endpoint or configure OPENAI_API_KEY on the server")
+    if any(ord(c) < 32 for c in key):
+        raise ValueError("API key must not contain control characters")
+    return replace(settings, openai_base_url=base, openai_api_key=key, openai_model=model)
+
+
+def _connection_metadata(settings: Settings) -> dict[str, str]:
+    return {"provider": settings.llm_provider, "model": settings.model,
+            "base_url": settings.openai_base_url if settings.llm_provider == "openai" else settings.ollama_url}
+
+
+async def _run_agent(job_id: str, settings: Settings) -> None:
     store = _store()
     job = store.get_job(job_id)
     message = store.get_job_message(job_id)
     store.set_job_running(job_id)
 
     try:
-        settings = replace(Settings.from_env(), ollama_model=job["model"])
         history = store.get_context(job["session_id"], job["user_message_id"], limit=10)
         prompt = _conversation_prompt(message, history)
         async with GrafanaMCPClient(
@@ -97,32 +166,39 @@ async def _run_agent(job_id: str) -> None:
             settings.mcp_server_token,
             settings.mcp_timeout_seconds,
         ) as mcp:
-            agent = OllamaAgent(settings, mcp, progress=lambda text: store.append_progress(job_id, text))
+            def redact(text: str) -> str:
+                return text.replace(settings.openai_api_key, "[REDACTED]") if settings.openai_api_key else text
+            agent = OllamaAgent(settings, mcp, progress=lambda text: store.append_progress(job_id, redact(text)))
             await agent.prepare()
             answer = await agent.run(prompt)
+        answer = redact(answer)
         store.complete_job(job_id, answer, _extract_dashboard_url(answer))
     except Exception as exc:
-        store.fail_job(job_id, str(exc))
+        error = str(exc)
+        if settings.openai_api_key:
+            error = error.replace(settings.openai_api_key, "[REDACTED]")
+        store.fail_job(job_id, error)
 
 
-def _launch_job(job_id: str) -> None:
+def _launch_job(job_id: str, settings: Settings) -> None:
     thread = threading.Thread(
-        target=lambda: asyncio.run(_run_agent(job_id)),
+        target=lambda: asyncio.run(_run_agent(job_id, settings)),
         name=f"ai-job-{job_id[:8]}",
         daemon=True,
     )
     thread.start()
 
 
-def _start_job(session_id: str, message: str) -> dict[str, Any]:
-    model = _selected_model(message, Settings.from_env())
-    job = _store().create_job(session_id, message, model)
-    _launch_job(job["id"])
+def _start_job(session_id: str, message: str, options: Any = None,
+               defaults: Any = None) -> dict[str, Any]:
+    settings = _connection_settings(message, options, defaults)
+    job = _store().create_job(session_id, message, settings.model, _connection_metadata(settings))
+    _launch_job(job["id"], settings)
     return job
 
 
 class Handler(BaseHTTPRequestHandler):
-    server_version = "GrafanaLocalAI/0.2"
+    server_version = "GrafanaLocalAI/0.3"
 
     def _json(self, status: int, payload: Any) -> None:
         raw = json.dumps(payload, ensure_ascii=False).encode()
@@ -140,11 +216,34 @@ class Handler(BaseHTTPRequestHandler):
         raw = self.rfile.read(length) if length else b"{}"
         return json.loads(raw)
 
+    def _proxy_connection(self) -> dict[str, str]:
+        result: dict[str, str] = {}
+        names = {
+            "provider": "X-Grafana-AI-Provider",
+            "base_url": "X-Grafana-AI-Base-URL",
+            "model": "X-Grafana-AI-Model",
+            "api_key": "X-Grafana-AI-API-Key",
+        }
+        for key, header in names.items():
+            value = (self.headers.get(header) or "").strip()
+            if value and value not in {"<no value>", "<nil>"}:
+                if len(value) > (16_384 if key == "api_key" else 2_048):
+                    raise ValueError(f"configured {key} is too long")
+                result[key] = value
+        return result
+
     def do_GET(self) -> None:
         path = self.path.split("?", 1)[0]
         try:
             if path == "/health":
                 self._json(200, {"ok": True, "service": "grafana-local-ai", "database": "ok"})
+                return
+            if path == "/connection":
+                settings = _configured_settings(self._proxy_connection())
+                self._json(200, {**_connection_metadata(settings),
+                                 "openai_base_url": settings.openai_base_url,
+                                 "openai_model": settings.openai_model,
+                                 "has_api_key": bool(settings.openai_api_key)})
                 return
             if path == "/stats":
                 self._json(200, _store().stats())
@@ -190,13 +289,18 @@ class Handler(BaseHTTPRequestHandler):
                     raise ValueError("message is required")
                 if len(message) > 20_000:
                     raise ValueError("message is too long")
-                job = _start_job(chat_match.group(1), message)
+                job = _start_job(chat_match.group(1), message, payload.get("connection"),
+                                 self._proxy_connection())
                 self._json(202, {"job_id": job["id"], "status": job["status"], "model": job["model"]})
                 return
             retry_match = re.fullmatch(r"/jobs/([A-Fa-f0-9]+)/retry", path)
             if retry_match:
-                job = _store().retry_job(retry_match.group(1))
-                _launch_job(job["id"])
+                original = _store().get_job(retry_match.group(1))
+                options = payload.get("connection", original["connection"] or {"provider": "ollama", "model": original["model"]})
+                settings = _connection_settings(_store().get_job_message(original["id"]), options,
+                                                self._proxy_connection())
+                job = _store().retry_job(original["id"], settings.model, _connection_metadata(settings))
+                _launch_job(job["id"], settings)
                 self._json(202, {"job_id": job["id"], "status": job["status"], "model": job["model"]})
                 return
             self._json(404, {"error": "not found"})

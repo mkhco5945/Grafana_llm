@@ -7,7 +7,7 @@
   "preload": true,
   "info": {
     "keywords": ["ai", "dashboard", "ollama", "prometheus", "mcp"],
-    "description": "Local AI assistant for exploring Grafana data and creating dashboards with Ollama and Grafana MCP.",
+    "description": "AI assistant for Grafana data and dashboards using Ollama or OpenAI-compatible APIs and Grafana MCP.",
     "author": {
       "name": "mkhco"
     },
@@ -16,8 +16,8 @@
       "large": "img/logo.svg"
     },
     "screenshots": [],
-    "version": "0.2.0",
-    "updated": "2026-09-28"
+    "version": "0.5.0",
+    "updated": "2026-09-30"
   },
   "includes": [
     {
@@ -25,7 +25,8 @@
       "name": "Create dashboard with AI",
       "path": "/a/mkhco-ai-dashboard-app",
       "addToNav": true,
-      "defaultNav": true
+      "defaultNav": true,
+      "role": "Editor"
     }
   ],
   "routes": [
@@ -33,7 +34,13 @@
       "path": "ai/*",
       "url": "http://host.docker.internal:8010",
       "reqSignedIn": true,
-      "reqRole": "Editor"
+      "reqRole": "Editor",
+      "headers": [
+        { "name": "X-Grafana-AI-Provider", "content": "{{ .JsonData.llmProvider }}" },
+        { "name": "X-Grafana-AI-Base-URL", "content": "{{ .JsonData.openaiBaseUrl }}" },
+        { "name": "X-Grafana-AI-Model", "content": "{{ .JsonData.openaiModel }}" },
+        { "name": "X-Grafana-AI-API-Key", "content": "{{ .SecureJsonData.openaiApiKey }}" }
+      ]
     }
   ],
   "extensions": {

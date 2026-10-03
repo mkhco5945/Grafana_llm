@@ -70,6 +70,9 @@ class FakeMCP:
     def __init__(self):
         self.calls = []
 
+    async def list_tools(self):
+        return [FakeTool(name) for name in ALLOWED_TOOL_NAMES]
+
     async def call_tool(self, name, arguments):
         self.calls.append((name, arguments))
         return SimpleNamespace(is_error=False, structured_content={"ok": True}, content=[])
@@ -187,6 +190,20 @@ class AgentLoopTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result, "done")
         self.assertEqual(mcp.calls, [("list_datasources", {"type": "prometheus"})])
         self.assertEqual(agent.messages[-2]["role"], "tool")
+
+    async def test_prepare_exposes_dashboard_write_tool_from_first_turn(self):
+        agent = OllamaAgent(self._settings(), FakeMCP(), progress=lambda _: None)
+
+        await agent.prepare()
+
+        self.assertIn("update_dashboard", agent.mcp_tool_names)
+
+    def test_persian_dashboard_write_intent_is_detected(self):
+        self.assertTrue(
+            OllamaAgent._prompt_expects_dashboard_write(
+                "یک داشبورد برای خطاهای سرویس بساز و ذخیره کن"
+            )
+        )
 
     async def test_max_turn_limit_stops_repeated_tool_calls(self):
         async def request(_payload):
@@ -803,6 +820,38 @@ class AgentLoopTests(unittest.IsolatedAsyncioTestCase):
         payload = json.loads(await agent._dispatch_tool_call("update_dashboard", args, fp))
         self.assertEqual(payload["error"], "UNKNOWN_PROMETHEUS_METRIC")
         self.assertEqual(mcp.calls, [])
+
+    async def test_query_rejected_before_discovery_can_retry_after_catalog_arrives(self):
+        result = SimpleNamespace(
+            is_error=False,
+            structured_content=None,
+            content=[TextItem(json.dumps({"data": [{"value": [1, "1"]}]}))],
+        )
+        mcp = ResultMCP(result)
+        agent = OllamaAgent(self._settings(), mcp, progress=lambda _: None)
+        agent._prewrite_guard_enabled = True
+        args = {
+            "datasourceUid": "prometheus",
+            "expr": "demo_http_requests_total",
+            "endTime": "now",
+            "queryType": "instant",
+        }
+        fingerprint = agent.tool_call_fingerprint("query_prometheus", args)
+
+        first = json.loads(
+            await agent._dispatch_tool_call("query_prometheus", args, fingerprint)
+        )
+        self.assertEqual(first["error"], "METRICS_NOT_DISCOVERED")
+
+        agent._capture_metric_catalog(
+            json.dumps({"content": [["demo_http_requests_total"]]})
+        )
+        second = json.loads(
+            await agent._dispatch_tool_call("query_prometheus", args, fingerprint)
+        )
+
+        self.assertEqual(second["status"], "validated")
+        self.assertEqual([call[0] for call in mcp.calls], ["query_prometheus"])
 
     async def test_dashboard_gate_allows_only_validated_expression(self):
         mcp = ResultMCP(SimpleNamespace(is_error=False, structured_content=None, content=[]))

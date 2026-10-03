@@ -90,6 +90,9 @@ class ChatStore:
                 );
                 """
             )
+            columns = {row["name"] for row in connection.execute("PRAGMA table_info(jobs)")}
+            if "connection" not in columns:
+                connection.execute("ALTER TABLE jobs ADD COLUMN connection TEXT NOT NULL DEFAULT '{}'")
 
     @staticmethod
     def _id() -> str:
@@ -160,6 +163,7 @@ class ChatStore:
             "session_id": row["session_id"],
             "user_message_id": row["user_message_id"],
             "model": row["model"],
+            "connection": json.loads(row["connection"]),
             "status": row["status"],
             "progress": self._decode_progress(row["progress"]),
             "answer": row["answer"],
@@ -202,7 +206,7 @@ class ChatStore:
             "active_job": active,
         }
 
-    def create_job(self, session_id: str, message: str, model: str) -> dict[str, Any]:
+    def create_job(self, session_id: str, message: str, model: str, llm_connection: dict | None = None) -> dict[str, Any]:
         message = message.strip()
         if not message:
             raise ValueError("message is required")
@@ -230,12 +234,13 @@ class ChatStore:
                 (job_id, session_id, message_id, model, now, now),
             )
             title = session["title"]
+            self._save_connection(connection, job_id, llm_connection or {})
             if title == "New chat":
                 title = self._message_title(message)
             connection.execute("UPDATE sessions SET title = ?, updated_at = ? WHERE id = ?", (title, now, session_id))
         return self.get_job(job_id)
 
-    def retry_job(self, job_id: str, model: str | None = None) -> dict[str, Any]:
+    def retry_job(self, job_id: str, model: str | None = None, llm_connection: dict | None = None) -> dict[str, Any]:
         now = time.time()
         retry_id = self._id()
         with self._write_lock, self._connect() as connection:
@@ -256,8 +261,15 @@ class ChatStore:
                 """,
                 (retry_id, original["session_id"], original["user_message_id"], model or original["model"], now, now),
             )
+            self._save_connection(connection, retry_id, llm_connection if llm_connection is not None else json.loads(original["connection"]))
             connection.execute("UPDATE sessions SET updated_at = ? WHERE id = ?", (now, original["session_id"]))
         return self.get_job(retry_id)
+
+    @staticmethod
+    def _save_connection(connection, job_id: str, values: dict) -> None:
+        # Persist only non-secret routing metadata, never API keys.
+        safe = {key: values[key] for key in ("provider", "base_url", "model") if key in values}
+        connection.execute("UPDATE jobs SET connection = ? WHERE id = ?", (json.dumps(safe), job_id))
 
     def get_job(self, job_id: str) -> dict[str, Any]:
         with self._connect() as connection:

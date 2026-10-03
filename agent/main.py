@@ -135,7 +135,7 @@ class GroundedOllamaAgent(OllamaAgent):
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Local Ollama Grafana MCP agent")
+    parser = argparse.ArgumentParser(description="Grafana MCP agent with Ollama or OpenAI-compatible models")
     parser.add_argument("prompt", nargs="*", help="One-shot request; omit for interactive mode")
     return parser.parse_args()
 
@@ -155,7 +155,7 @@ async def run() -> int:
                 answer = await agent.run(" ".join(args.prompt))
                 print(f"\n{answer}")
                 print(
-                    f"\n[agent] completed with {agent.inference_turns} qwen inference "
+                    f"\n[agent] completed with {agent.inference_turns} model inference "
                     f"turn(s) and {agent.mcp_calls} MCP call(s)"
                 )
                 return 0
@@ -174,7 +174,7 @@ async def run() -> int:
                     answer = await agent.run(prompt)
                     print(f"\n{answer}")
                     print(
-                        f"\n[agent] session totals: {agent.inference_turns} qwen "
+                        f"\n[agent] session totals: {agent.inference_turns} model "
                         f"inference turn(s), {agent.mcp_calls} MCP call(s)"
                     )
                 except OllamaError as exc:

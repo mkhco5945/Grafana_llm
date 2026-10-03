@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import os
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 from dotenv import load_dotenv
 
@@ -34,16 +34,33 @@ class Settings:
     max_tool_result_chars: int
     demo_api_timeout_seconds: float
     demo_scrape_wait_seconds: float
+    llm_provider: str = "ollama"
+    openai_base_url: str = "https://api.openai.com/v1"
+    openai_api_key: str = field(default="", repr=False)
+    openai_model: str = ""
+    openai_timeout_seconds: float = 180
+
+    @property
+    def model(self) -> str:
+        return self.openai_model if self.llm_provider == "openai" else self.ollama_model
 
     @classmethod
     def from_env(cls, env_file: str | None = None) -> "Settings":
         load_dotenv(env_file, override=False)
+        provider = os.getenv("LLM_PROVIDER", "ollama").strip().lower()
+        if provider not in {"ollama", "openai"}:
+            raise ValueError("LLM_PROVIDER must be ollama or openai")
         token = os.getenv("MCP_GRAFANA_SERVER_TOKEN", "").strip()
         if not token:
             raise ValueError(
                 "MCP_GRAFANA_SERVER_TOKEN is required; set it in .env or the environment"
             )
         return cls(
+            llm_provider=provider,
+            openai_base_url=os.getenv("OPENAI_BASE_URL", "https://api.openai.com/v1").strip().rstrip("/"),
+            openai_api_key=os.getenv("OPENAI_API_KEY", "").strip(),
+            openai_model=os.getenv("OPENAI_MODEL", "").strip(),
+            openai_timeout_seconds=float(os.getenv("OPENAI_TIMEOUT_SECONDS", "180")),
             ollama_url=os.getenv("OLLAMA_URL", "http://127.0.0.1:11434").rstrip("/"),
             ollama_model=os.getenv("OLLAMA_MODEL", "qwen3:8b"),
             mcp_grafana_url=os.getenv(

@@ -6,7 +6,6 @@ cd "$ROOT_DIR"
 
 die() { echo "[start] $*" >&2; exit 1; }
 
-command -v ollama >/dev/null 2>&1 || die "Ollama is not installed or not on PATH."
 command -v docker >/dev/null 2>&1 || die "Docker is not installed or not on PATH."
 command -v curl >/dev/null 2>&1 || die "curl is required."
 command -v uv >/dev/null 2>&1 || die "uv is required for the Python agent."
@@ -19,7 +18,16 @@ if [[ ! -f .env ]]; then
   die "Missing .env. Copy .env.example to .env and configure the existing Grafana/MCP tokens."
 fi
 
+# Parse dotenv with Python, never source it as shell code. Only non-secret
+# provider/model values leave this subprocess.
+uv sync
+LLM_PROVIDER="$(uv run --no-sync python -c 'from agent.config import Settings; print(Settings.from_env().llm_provider)')"
+export LLM_PROVIDER
+
 ollama_ready() { curl -fsS --max-time 3 http://127.0.0.1:11434/api/tags >/dev/null 2>&1; }
+model_runtime_ready() { [[ "$LLM_PROVIDER" == "openai" ]] || ollama_ready; }
+if [[ "$LLM_PROVIDER" == "ollama" ]]; then
+command -v ollama >/dev/null 2>&1 || die "Ollama is required only for LLM_PROVIDER=ollama. Use LLM_PROVIDER=openai for external APIs."
 if ! ollama_ready; then
   echo "[start] Ollama API is not responding; attempting to start the existing service..."
   if command -v systemctl >/dev/null 2>&1 && systemctl list-unit-files ollama.service >/dev/null 2>&1; then
@@ -31,8 +39,8 @@ if ! ollama_ready; then
 fi
 ollama_ready || die "Ollama is installed but its API is unavailable. Start the existing Ollama service and retry."
 
-DASHBOARD_MODEL="${AI_DASHBOARD_MODEL:-qwen3:8b}"
-FAST_MODEL="${AI_FAST_MODEL:-qwen3:4b}"
+DASHBOARD_MODEL="$(uv run --no-sync python -c 'from agent.config import Settings; import os; Settings.from_env(); print(os.getenv("AI_DASHBOARD_MODEL") or "qwen3:8b")')"
+FAST_MODEL="$(uv run --no-sync python -c 'from agent.config import Settings; import os; Settings.from_env(); print(os.getenv("AI_FAST_MODEL") or "qwen3:4b")')"
 model_installed() {
   ollama list | awk 'NR > 1 {print $1}' | grep -Fxq "$1"
 }
@@ -42,6 +50,10 @@ if ! model_installed "$FAST_MODEL"; then
   export AI_FAST_MODEL="$DASHBOARD_MODEL"
 fi
 export AI_DASHBOARD_MODEL="$DASHBOARD_MODEL"
+else
+  echo "[start] External model API selected; Ollama installation, service, and model checks skipped."
+  echo "[start] Configure API connection in Grafana or OPENAI_* values in .env."
+fi
 
 if [[ "${AI_PLUGIN_ALREADY_BUILT:-0}" != "1" ]]; then
   echo "[start] Building Grafana AI app plugin locally with Node $(node --version)..."
@@ -83,7 +95,7 @@ container_health() {
 
 echo "[start] Waiting for healthy Docker services..."
 deadline=$((SECONDS + 180))
-until container_health grafana && container_health prometheus && container_health demo && container_health mcp-grafana && ollama_ready; do
+until container_health grafana && container_health prometheus && container_health demo && container_health mcp-grafana && model_runtime_ready; do
   (( SECONDS < deadline )) || {
     docker compose ps >&2 || true
     docker compose logs --no-color --tail=120 grafana >&2 || true
@@ -92,19 +104,24 @@ until container_health grafana && container_health prometheus && container_healt
   sleep 2
 done
 
-# Plugin proxy routes require an org-scoped plugin settings row. autoEnabled makes
-# the app visible, but does not guarantee that row exists on an already-running
-# Grafana data volume. Upsert it explicitly so repeated local runs are reliable.
+# Keep the existing jsonData/secureJsonData intact. Re-running this script must
+# never erase the provider, model, base URL, or encrypted API key saved in Grafana.
 echo "[start] Ensuring the AI app is enabled for Grafana org 1..."
-if ! curl -fsS --max-time 10 -u admin:admin \
-  -H 'Content-Type: application/json' \
-  -X POST http://127.0.0.1:3000/api/plugins/mkhco-ai-dashboard-app/settings \
-  -d '{"enabled":true,"pinned":false,"jsonData":{}}' >/dev/null; then
+plugin_settings="$(curl -fsS --max-time 10 -u admin:admin \
+  http://127.0.0.1:3000/api/plugins/mkhco-ai-dashboard-app/settings)" || plugin_settings=''
+if [[ -z "$plugin_settings" ]]; then
   echo "[start] Failed to create/update Grafana app settings. Current plugin settings response:" >&2
   curl -sS --max-time 10 -u admin:admin \
     http://127.0.0.1:3000/api/plugins/mkhco-ai-dashboard-app/settings >&2 || true
   printf '\n' >&2
   die "Could not enable AI Dashboard Builder app."
+fi
+plugin_enabled="$(printf '%s' "$plugin_settings" | uv run --no-sync python -c 'import json,sys; print("1" if json.load(sys.stdin).get("enabled") else "0")')"
+if [[ "$plugin_enabled" != "1" ]]; then
+  enable_payload="$(printf '%s' "$plugin_settings" | uv run --no-sync python -c 'import json,sys; v=json.load(sys.stdin); print(json.dumps({"enabled": True, "pinned": bool(v.get("pinned")), "jsonData": v.get("jsonData") or {}}))')"
+  curl -fsS --max-time 10 -u admin:admin -H 'Content-Type: application/json' \
+    -X POST http://127.0.0.1:3000/api/plugins/mkhco-ai-dashboard-app/settings \
+    -d "$enable_payload" >/dev/null || die "Could not enable AI Dashboard Builder app."
 fi
 
 if [[ ! -x .venv/bin/python ]]; then
@@ -118,7 +135,10 @@ mkdir -p .run .state
 AI_PID_FILE=".run/ai-api.pid"
 AI_LOG_FILE=".run/ai-api.log"
 AI_CODE_FILE=".run/ai-api.code.sha256"
-AI_CODE_HASH="$(find agent -maxdepth 1 -type f -name '*.py' -print0 | sort -z | xargs -0 sha256sum | sha256sum | awk '{print $1}')"
+AI_CODE_HASH="$(find agent .env -maxdepth 1 -type f \( -name '*.py' -o -name '.env' \) -print0 | sort -z | xargs -0 sha256sum | sha256sum | awk '{print $1}')"
+# Include effective environment overrides; emit only a digest, never credentials.
+AI_CONFIG_HASH="$(uv run --no-sync python -c 'import hashlib,json,os; from dataclasses import asdict; from agent.config import Settings; value=asdict(Settings.from_env()); value.update({k:os.getenv(k, "") for k in ("AI_FAST_MODEL", "AI_DASHBOARD_MODEL", "AI_CHAT_DB_PATH")}); print(hashlib.sha256(json.dumps(value,sort_keys=True).encode()).hexdigest())')"
+AI_CODE_HASH="$AI_CODE_HASH:$AI_CONFIG_HASH"
 ai_api_ready() { curl -fsS --max-time 3 http://127.0.0.1:8010/health >/dev/null 2>&1; }
 
 restart_ai_bridge=0
@@ -153,7 +173,6 @@ if ! ai_api_ready; then
   echo "[start] Starting host-side AI bridge on port 8010..."
   : > "$AI_LOG_FILE"
   AI_API_HOST=0.0.0.0 AI_API_PORT=8010 AI_CHAT_DB_PATH="${AI_CHAT_DB_PATH:-.state/ai-chat.sqlite3}" \
-    AI_FAST_MODEL="${AI_FAST_MODEL:-$FAST_MODEL}" AI_DASHBOARD_MODEL="$DASHBOARD_MODEL" \
     nohup uv run --no-sync python -m agent.api </dev/null >>"$AI_LOG_FILE" 2>&1 &
   echo $! > "$AI_PID_FILE"
 fi

@@ -36,7 +36,7 @@ Rules:
 - For dashboard requests: discover metric names once, use only exact names from the live catalog, validate every required PromQL expression, reuse those exact validated expressions, then call update_dashboard and verify it.
 - A plausible-looking metric name is invalid unless it appeared in the live metric catalog. Never invent aliases or approximate names.
 - Validate important PromQL queries with query_prometheus before creating or updating a dashboard.
-- Create or update dashboards only with update_dashboard. Prefer a useful, simple dashboard with clear units and legends.
+- Create or update dashboards only with update_dashboard. The tool is available from the beginning of every authorized session; never claim that it is unavailable. Prefer a useful, simple dashboard with clear units and legends.
 - For an existing dashboard, use update_dashboard patch mode with its uid and operations; do not send a full replacement dashboard object that can carry a stale version.
 - MCP dashboard responses wrap the actual Grafana dashboard document. update_dashboard patch paths are always relative to that actual document; use $.panels, never $.dashboard.panels from a response envelope.
 - A renderable classic dashboard stores complete panel objects directly in its top-level panels array. Every panel needs a unique numeric id, title, visualization type, positive gridPos, Prometheus datasource, target PromQL, and an appropriate unit.
@@ -212,7 +212,11 @@ class OllamaAgent:
     ) -> None:
         self.settings = settings
         self.mcp = mcp
-        self._ollama_request = ollama_request or self._request_ollama
+        if getattr(settings, "llm_provider", "ollama") == "openai":
+            from .openai_client import OpenAIChatClient
+            self._ollama_request = ollama_request or OpenAIChatClient(settings).request
+        else:
+            self._ollama_request = ollama_request or self._request_ollama
         self.progress = progress or (lambda message: print(message, flush=True))
         self.messages: list[dict[str, Any]] = [{"role": "system", "content": SYSTEM_PROMPT}]
         self.tools: list[dict[str, Any]] = []
@@ -270,7 +274,13 @@ class OllamaAgent:
         missing = ALLOWED_TOOL_NAMES - set(self._all_mcp_tools)
         if missing:
             raise OllamaError(f"MCP allowlist missing from server: {sorted(missing)}")
-        self._set_tool_phase(CORE_DISCOVERY_TOOL_NAMES)
+        # Keep the write tool in the model schema from the first turn. The
+        # dashboard gate below still rejects writes until every referenced
+        # PromQL expression has been discovered and validated. Hiding the tool
+        # during discovery made tool-capable models correctly plan a write but
+        # then fail with "unknown/non-allowlisted tool", especially when write
+        # intent was expressed in a language our lightweight detector missed.
+        self._set_tool_phase(CORE_DISCOVERY_TOOL_NAMES | {"update_dashboard"})
 
     def _set_tool_phase(self, names: set[str] | frozenset[str]) -> None:
         selected = [self._all_mcp_tools[name] for name in names]
@@ -289,11 +299,9 @@ class OllamaAgent:
 
     def _set_request_tool_phase(self, user_prompt: str) -> None:
         """Expose the lean default set, opting into label tools when relevant."""
-        names = set(CORE_DISCOVERY_TOOL_NAMES)
+        names = set(CORE_DISCOVERY_TOOL_NAMES) | {"update_dashboard"}
         if self._prompt_requests_label_discovery(user_prompt):
             names |= LABEL_DISCOVERY_TOOL_NAMES
-        if self._dashboard_tools_enabled:
-            names.add("update_dashboard")
         self._set_tool_phase(names)
 
     @staticmethod
@@ -311,16 +319,21 @@ class OllamaAgent:
             for phrase in ("do not create", "don't create", "do not modify", "don't modify", "inspect the existing", "retrieve the existing")
         ) and not any(phrase in lowered for phrase in ("update_dashboard", "update the existing", "correct the existing", "patch the existing")):
             return False
-        return "dashboard" in lowered and any(
-            word in lowered
-            for word in ("create", "build", "make", "update", "new", "patch", "correct", "repair")
+        dashboard_words = ("dashboard", "داشبورد")
+        write_words = (
+            "create", "build", "make", "update", "new", "patch", "correct", "repair", "save",
+            "بساز", "ساخت", "ایجاد", "ذخیره", "ویرایش", "تغییر", "اصلاح", "آپدیت", "به‌روز", "بروز",
+        )
+        return any(word in lowered for word in dashboard_words) and any(
+            word in lowered for word in write_words
         )
 
     @staticmethod
     def _prompt_is_dashboard_repair(prompt: str) -> bool:
         lowered = prompt.lower()
-        return "dashboard" in lowered and any(
-            word in lowered for word in ("existing", "patch", "correct", "repair")
+        return any(word in lowered for word in ("dashboard", "داشبورد")) and any(
+            word in lowered
+            for word in ("existing", "patch", "correct", "repair", "ویرایش", "تغییر", "اصلاح", "آپدیت", "به‌روز", "بروز")
         )
 
     @staticmethod
@@ -408,7 +421,7 @@ class OllamaAgent:
                 )
             response = await self._ollama_request(
                 {
-                    "model": self.settings.ollama_model,
+                    "model": getattr(self.settings, "model", self.settings.ollama_model),
                     "messages": self.messages,
                     "tools": self.tools,
                     "stream": False,
@@ -426,7 +439,7 @@ class OllamaAgent:
             self._log_inference_stats(response)
             message = response.get("message")
             if not isinstance(message, dict):
-                raise OllamaError(f"Ollama response omitted message: {response}")
+                raise OllamaError("Model response omitted message")
             self.messages.append(message)
             tool_calls = message.get("tool_calls") or []
             if not tool_calls:
@@ -435,14 +448,14 @@ class OllamaAgent:
                     done_reason = response.get("done_reason")
                     if done_reason in {"length", "max_tokens"}:
                         raise OllamaError(
-                            "Ollama generation ended at its length limit without a final answer "
+                            "Model generation ended at its length limit without a final answer "
                             f"or tool calls (done_reason={done_reason}; "
                             f"output_tokens={response.get('eval_count', 'unknown')})"
                         )
                     if self._prewrite_guard_enabled and self._empty_output_retries < 1:
                         self._empty_output_retries += 1
                         self.progress(
-                            "[agent] Ollama returned an empty dashboard-planning response; "
+                            "[agent] Model returned an empty dashboard-planning response; "
                             "requesting one bounded continuation"
                         )
                         self.messages.append(
@@ -455,7 +468,7 @@ class OllamaAgent:
                             }
                         )
                         continue
-                    raise OllamaError("Ollama returned neither a final answer nor tool calls")
+                    raise OllamaError("Model returned neither a final answer nor tool calls")
                 verification_error = self._dashboard_completion_error()
                 if verification_error:
                     if self._post_write_completion_prompts < 2:
@@ -475,15 +488,16 @@ class OllamaAgent:
                         + json.dumps(verification_error, ensure_ascii=False)
                     )
                 return content
-            self.progress(f"[qwen] tool turn {turn}/{self.settings.max_tool_turns}: {len(tool_calls)} call(s)")
+            self.progress(f"[agent] tool turn {turn}/{self.settings.max_tool_turns}: {len(tool_calls)} call(s)")
             for call in tool_calls:
                 name, arguments = self._parse_tool_call(call)
-                self.progress(f"[qwen] requesting tool: {name} arguments={json.dumps(arguments, ensure_ascii=False)[:600]}")
+                self.progress(f"[agent] requesting tool: {name} arguments={json.dumps(arguments, ensure_ascii=False)[:600]}")
                 fingerprint = self.tool_call_fingerprint(name, arguments)
                 result_text = await self._dispatch_tool_call(name, arguments, fingerprint)
-                self.messages.append(
-                    {"role": "tool", "tool_name": name, "content": result_text}
-                )
+                tool_message = {"role": "tool", "tool_name": name, "content": result_text}
+                if getattr(self.settings, "llm_provider", "ollama") == "openai":
+                    tool_message["tool_call_id"] = call["id"]
+                self.messages.append(tool_message)
         raise OllamaError(
             f"Maximum tool-turn limit reached ({self.settings.max_tool_turns})"
         )
@@ -897,7 +911,22 @@ class OllamaAgent:
         }
         if not discovered:
             return
+        had_catalog = bool(self._discovered_metric_names)
         self._discovered_metric_names.update(discovered)
+        if not had_catalog and self._discovered_metric_names:
+            # A query rejected before metric discovery is safe to retry after
+            # the catalog arrives. Do not let that state-dependent rejection
+            # count as a persistent query-tool failure for the rest of the
+            # request.
+            for fingerprint in list(self._failed_call_fingerprints):
+                if (
+                    fingerprint.startswith(("query_prometheus:", "query_prometheus_histogram:"))
+                    and self._call_outcomes.get(fingerprint) == "rejected"
+                ):
+                    self._failed_call_fingerprints.pop(fingerprint, None)
+                    self._call_outcomes.pop(fingerprint, None)
+            self._tool_failure_counts["query_prometheus"] = 0
+            self._tool_failure_counts["query_prometheus_histogram"] = 0
         relevant = self._relevant_metric_names()
         suffix = ", ".join(sorted(relevant)[:12])
         self.progress(
@@ -1620,18 +1649,19 @@ class OllamaAgent:
                 f"tool_calls={len(tool_calls) if isinstance(tool_calls, list) else 0}",
             ]
         )
-        self.progress("[ollama] " + " ".join(details))
+        provider = getattr(self.settings, "llm_provider", "ollama")
+        self.progress(f"[{provider}] " + " ".join(details))
 
     def _parse_tool_call(self, call: Any) -> tuple[str, dict[str, Any]]:
         if not isinstance(call, dict):
-            raise OllamaError(f"Malformed Ollama tool call: {call!r}")
+            raise OllamaError(f"Malformed model tool call: {call!r}")
         function = call.get("function")
         if not isinstance(function, dict):
-            raise OllamaError(f"Malformed Ollama tool call function: {call!r}")
+            raise OllamaError(f"Malformed model tool call function: {call!r}")
         name = function.get("name")
         allowed_names = getattr(self, "tool_names", None) or self.mcp_tool_names
         if name not in allowed_names:
-            raise PermissionError(f"Ollama requested unknown/non-allowlisted tool: {name}")
+            raise PermissionError(f"Model requested unknown/non-allowlisted tool: {name}")
         arguments = function.get("arguments", {})
         if isinstance(arguments, str):
             try:

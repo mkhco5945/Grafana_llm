@@ -7,7 +7,7 @@ Grafana app (/a/mkhco-ai-dashboard-app)
   -> Grafana plugin proxy (/api/plugin-proxy/mkhco-ai-dashboard-app/ai/*)
   -> host agent.api (host.docker.internal:8010)
   -> SQLite (.state/ai-chat.sqlite3)
-  -> Ollama + mcp-grafana -> Grafana/Prometheus
+  -> Ollama or OpenAI-compatible API + mcp-grafana -> Grafana/Prometheus
 ```
 
 The browser never calls port 8010 directly. Grafana 12.1.1 loads the app with `AppPlugin.setRootPage` and forwards the `ai/*` proxy route to the host bridge. `start.sh` rebuilds the plugin and restarts Grafana because plugin metadata is read at Grafana startup.
@@ -26,6 +26,13 @@ Relevant Grafana 12.1.1 source:
 - [App proxy routes](https://grafana.com/developers/plugin-tools/how-to-guides/app-plugins/add-authentication-for-app-plugins)
 
 ## Persistent conversations
+
+For provider selection and key handling see [MODEL_PROVIDERS.md](MODEL_PROVIDERS.md).
+The current plugin version is `0.3.0`; the `0.2.0` discussion above records the
+original cache fix. Current smoke checks expect `module.js?_cache=0.3.0`.
+`GET /connection` exposes defaults and a boolean key-presence indicator, never the
+key. Chat and retry requests accept a `connection` object with provider, base URL,
+model and optional API key. Jobs persist only the non-secret fields.
 
 SQLite is the source of truth for sessions, messages, jobs, progress, results, errors, model names, and dashboard URLs. The frontend only uses localStorage for unsent drafts, the last selected session, and one-time migration bookkeeping.
 
@@ -71,7 +78,7 @@ The collector does not read `.env`, dump environments, or include chat messages/
 
 ## Start, stop, and intentional deletion
 
-`start.sh` never erases `.state/ai-chat.sqlite3`. It restarts the bridge only when bridge code changed or `AI_BRIDGE_FORCE_RESTART=1` is set. `stop.sh` stops processes but preserves chat history.
+`start.sh` never erases `.state/ai-chat.sqlite3`. It restarts the bridge when bridge code or `.env` changed, or `AI_BRIDGE_FORCE_RESTART=1` is set. `stop.sh` stops processes but preserves chat history.
 
 To intentionally erase all chat history, first run `./stop.sh`, then move `.state/ai-chat.sqlite3` and its `-wal`/`-shm` companions to a backup location or delete those three files explicitly. This is deliberately not part of either normal script.
 

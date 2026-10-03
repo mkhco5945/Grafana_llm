@@ -2,11 +2,25 @@
 
 ## Start
 
+Choose the model provider first. To use an external API without Ollama, set
+`LLM_PROVIDER=openai` in `.env`, then enter the base URL, API key and model in the
+Grafana app's **AI connection** section. Alternatively configure `OPENAI_BASE_URL`,
+`OPENAI_API_KEY` and `OPENAI_MODEL` in `.env` for both UI defaults and CLI use.
+See [full provider setup](docs/MODEL_PROVIDERS.md). Local mode remains `LLM_PROVIDER=ollama`.
+
 ```bash
 ./start.sh
 ```
 
-Docker-only startup (when Ollama and the Python environment are already ready):
+Windows PowerShell without WSL:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\start.ps1
+```
+
+This uses Docker Desktop with Docker VMM. See [docs/WINDOWS.md](docs/WINDOWS.md).
+
+Docker-only startup (when the selected model provider and Python bridge are already ready):
 
 ```bash
 docker compose up -d

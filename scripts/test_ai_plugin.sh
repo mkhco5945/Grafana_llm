@@ -178,8 +178,8 @@ rg -q '"markerVisible"[[:space:]]*:[[:space:]]*true' .run/smoke-frontend.json \
   || fail 'Rendered Grafana page is missing data-testid=ai-dashboard-builder-root'
 rg -q '"appNotFoundVisible"[[:space:]]*:[[:space:]]*false' .run/smoke-frontend.json \
   || fail 'Rendered Grafana page shows App not found'
-rg -q 'module.js\?_cache=0.2.0' .run/smoke-frontend.json \
-  || fail 'Browser did not load the cache-busted 0.2.0 plugin module'
+rg -q 'module.js\?_cache=0.3.0' .run/smoke-frontend.json \
+  || fail 'Browser did not load the cache-busted 0.3.0 plugin module'
 rg -q '"assistantMessageCount"[[:space:]]*:[[:space:]]*[1-9]' .run/smoke-frontend.json \
   || fail 'Rendered Grafana page did not restore the persisted assistant response'
 echo 'PASS: real browser rendered the root marker and server-restored assistant response without App not found'

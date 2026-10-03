@@ -1,8 +1,14 @@
 # Local Grafana + Prometheus + Grafana MCP playground
 
-This repository contains a local monitoring playground, the official Grafana MCP server, and a small host-side Python agent that lets a local Ollama model operate Grafana through structured MCP tool calls. It does not use Grafana Assistant or a hosted LLM.
+This repository contains a local monitoring playground, the official Grafana MCP server, and a host-side Python agent that lets either local Ollama models or external OpenAI-compatible models operate Grafana through structured MCP tool calls. It does not use Grafana Assistant.
+
+**External API support:** Set `LLM_PROVIDER=openai` to run without installing or starting Ollama. A Grafana organization admin can save the provider, base URL, encrypted API key and model ID in **AI connection**. Editor/Admin users can then use the persistent connection from the app page or the global chat drawer on non-dashboard Grafana pages. See [model providers and setup](docs/MODEL_PROVIDERS.md) for external API/CLI configuration, key handling and retries. The Ollama setup and run measurements below describe the original local demo.
 
 For the shortest practical walkthrough, see [DEMO.md](DEMO.md). Start the complete demo with `./start.sh`.
+
+On Windows, WSL is optional. Docker Desktop 4.86+ can use **Docker VMM** for Linux
+containers while the Python bridge runs directly on Windows. Use `start.ps1` and
+`stop.ps1`; see [Windows without WSL](docs/WINDOWS.md).
 
 ```text
 User ── Python agent ── Ollama: http://127.0.0.1:11434
@@ -87,7 +93,7 @@ Relevant tools include:
 
 ## Local Python agent
 
-The agent runs on the WSL host, where both Ollama and the loopback-only MCP endpoint are directly available. It intentionally avoids a large agent framework. The MCP Python SDK discovers live tool definitions, the agent converts the selected schemas to Ollama function tools, and only Ollama's native structured `tool_calls` are dispatched. Plain-text or unknown tool requests are never executed.
+The agent runs on the WSL/Linux host, where the loopback-only MCP endpoint is available. It intentionally avoids a large agent framework. The MCP Python SDK discovers live tool definitions, and only structured `tool_calls` from the configured Ollama or OpenAI-compatible provider are dispatched. Plain-text or unknown tool requests are never executed. External mode requires no local model service.
 
 Install the locked Python environment:
 
